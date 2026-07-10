@@ -757,6 +757,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
 	})
 
+	// Service principals are deliberately confined to these fixed read-only
+	// handlers. They bypass the general user Auth middleware so an mcs_ token
+	// cannot be reinterpreted as a user credential or reach arbitrary /api routes.
+	serviceTokens := middleware.DBServiceTokenResolver{Queries: queries}
+	r.Route("/api/control-plane", func(r chi.Router) {
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneAgentsRead)).Get("/agents", h.ControlPlaneAgents)
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneTasksRead)).Get("/tasks", h.ControlPlaneTasks)
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneBriefRead)).Get("/brief", h.ControlPlaneBrief)
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneStatusRead)).Get("/status", h.ControlPlaneStatus)
+	})
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
@@ -838,6 +849,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
+					// Service principals and their mcs_ credentials are admin-only.
+					r.Get("/service-principals", h.ListServicePrincipals)
+					r.Post("/service-principals", h.CreateServicePrincipal)
+					r.Patch("/service-principals/{principalId}", h.UpdateServicePrincipal)
+					r.Post("/service-principals/{principalId}/tokens", h.IssueServiceToken)
+					r.Delete("/service-principals/{principalId}/tokens/{tokenId}", h.RevokeServiceToken)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)
