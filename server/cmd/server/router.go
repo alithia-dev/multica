@@ -849,6 +849,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
+					// Service principals and their mcs_ credentials are admin-only.
+					r.Post("/service-principals", h.CreateServicePrincipal)
+					r.Post("/service-principals/{principalId}/tokens", h.IssueServiceToken)
+					r.Delete("/service-principals/{principalId}/tokens/{tokenId}", h.RevokeServiceToken)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)
