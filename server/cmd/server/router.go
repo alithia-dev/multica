@@ -757,6 +757,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
 	})
 
+	// Service principals are deliberately confined to these fixed read-only
+	// handlers. They bypass the general user Auth middleware so an mcs_ token
+	// cannot be reinterpreted as a user credential or reach arbitrary /api routes.
+	serviceTokens := middleware.DBServiceTokenResolver{Queries: queries}
+	r.Route("/api/control-plane", func(r chi.Router) {
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneAgentsRead)).Get("/agents", h.ControlPlaneAgents)
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneTasksRead)).Get("/tasks", h.ControlPlaneTasks)
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneBriefRead)).Get("/brief", h.ControlPlaneBrief)
+		r.With(middleware.ControlPlaneAuth(serviceTokens, middleware.ControlPlaneStatusRead)).Get("/status", h.ControlPlaneStatus)
+	})
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
