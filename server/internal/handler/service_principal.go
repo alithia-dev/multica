@@ -14,6 +14,13 @@ import (
 
 const maxServiceTokenLifetimeDays = 365
 
+var allowedServiceTokenScopes = map[string]struct{}{
+	"control_plane.agents.read": {},
+	"control_plane.tasks.read":  {},
+	"control_plane.brief.read":  {},
+	"control_plane.status.read": {},
+}
+
 type ServicePrincipalResponse struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
@@ -22,6 +29,9 @@ type ServicePrincipalResponse struct {
 }
 type CreateServicePrincipalRequest struct {
 	Name string `json:"name"`
+}
+type UpdateServicePrincipalRequest struct {
+	Disabled *bool `json:"disabled"`
 }
 type IssueServiceTokenRequest struct {
 	Scopes        []string `json:"scopes"`
@@ -68,6 +78,82 @@ func (h *Handler) CreateServicePrincipal(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusCreated, ServicePrincipalResponse{ID: row.ID, Name: row.Name, Disabled: row.Disabled, CreatedAt: row.CreatedAt.UTC().Format(time.RFC3339)})
 }
 
+func (h *Handler) ListServicePrincipals(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace id")
+	if !ok {
+		return
+	}
+	rows, err := h.DB.Query(r.Context(), `SELECT id::text, name, disabled, created_at FROM service_principal WHERE workspace_id = $1 ORDER BY created_at ASC`, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list service principals")
+		return
+	}
+	defer rows.Close()
+	principals := make([]ServicePrincipalResponse, 0)
+	for rows.Next() {
+		var row struct {
+			ID, Name  string
+			Disabled  bool
+			CreatedAt time.Time
+		}
+		if err := rows.Scan(&row.ID, &row.Name, &row.Disabled, &row.CreatedAt); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list service principals")
+			return
+		}
+		principals = append(principals, ServicePrincipalResponse{ID: row.ID, Name: row.Name, Disabled: row.Disabled, CreatedAt: row.CreatedAt.UTC().Format(time.RFC3339)})
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list service principals")
+		return
+	}
+	writeJSON(w, http.StatusOK, principals)
+}
+
+func (h *Handler) UpdateServicePrincipal(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace id")
+	if !ok {
+		return
+	}
+	principalID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "principalId"), "service principal id")
+	if !ok {
+		return
+	}
+	var req UpdateServicePrincipalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Disabled == nil {
+		writeError(w, http.StatusBadRequest, "disabled is required")
+		return
+	}
+	var row struct {
+		ID, Name  string
+		Disabled  bool
+		CreatedAt time.Time
+	}
+	err := h.DB.QueryRow(r.Context(), `UPDATE service_principal SET disabled = $1 WHERE id = $2 AND workspace_id = $3 RETURNING id::text, name, disabled, created_at`, *req.Disabled, principalID, workspaceID).Scan(&row.ID, &row.Name, &row.Disabled, &row.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "service principal not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update service principal")
+		return
+	}
+	writeJSON(w, http.StatusOK, ServicePrincipalResponse{ID: row.ID, Name: row.Name, Disabled: row.Disabled, CreatedAt: row.CreatedAt.UTC().Format(time.RFC3339)})
+}
+
+func validateServiceTokenScopes(scopes []string) bool {
+	seen := make(map[string]struct{}, len(scopes))
+	for _, scope := range scopes {
+		if _, allowed := allowedServiceTokenScopes[scope]; !allowed {
+			return false
+		}
+		if _, duplicate := seen[scope]; duplicate {
+			return false
+		}
+		seen[scope] = struct{}{}
+	}
+	return true
+}
+
 func (h *Handler) IssueServiceToken(w http.ResponseWriter, r *http.Request) {
 	workspaceID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace id")
 	if !ok {
@@ -84,6 +170,10 @@ func (h *Handler) IssueServiceToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Scopes) == 0 {
 		writeError(w, http.StatusBadRequest, "at least one scope is required")
+		return
+	}
+	if !validateServiceTokenScopes(req.Scopes) {
+		writeError(w, http.StatusBadRequest, "scopes must be unique allowed control-plane read scopes")
 		return
 	}
 	if req.ExpiresInDays < 1 || req.ExpiresInDays > maxServiceTokenLifetimeDays {

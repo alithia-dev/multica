@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -17,6 +18,8 @@ const (
 	ControlPlaneBriefRead  = "control_plane.brief.read"
 	ControlPlaneStatusRead = "control_plane.status.read"
 )
+
+const serviceTokenLastUsedUpdateTimeout = time.Second
 
 var ErrServiceTokenNotFound = errors.New("service token not found")
 
@@ -48,9 +51,12 @@ func (r DBServiceTokenResolver) ResolveServiceToken(ctx context.Context, rawToke
 	if err != nil {
 		return ServicePrincipalIdentity{}, ErrServiceTokenNotFound
 	}
-	// Last-used bookkeeping is deliberately non-authoritative and never lets a
-	// failed update change a successful authorization result.
-	go r.Queries.UpdateServiceTokenLastUsed(context.Background(), row.TokenID)
+	// Last-used bookkeeping is deliberately non-authoritative, rate-bounded by
+	// the query, and synchronous with a short deadline so authorization never
+	// leaves an unbounded background goroutine behind.
+	lastUsedCtx, cancel := context.WithTimeout(ctx, serviceTokenLastUsedUpdateTimeout)
+	defer cancel()
+	_ = r.Queries.UpdateServiceTokenLastUsed(lastUsedCtx, row.TokenID)
 	return ServicePrincipalIdentity{
 		ServicePrincipalID: util.UUIDToString(row.ServicePrincipalID),
 		WorkspaceID:        util.UUIDToString(row.WorkspaceID),

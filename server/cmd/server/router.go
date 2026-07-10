@@ -850,7 +850,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
 					// Service principals and their mcs_ credentials are admin-only.
+					r.Get("/service-principals", h.ListServicePrincipals)
 					r.Post("/service-principals", h.CreateServicePrincipal)
+					r.Patch("/service-principals/{principalId}", h.UpdateServicePrincipal)
 					r.Post("/service-principals/{principalId}/tokens", h.IssueServiceToken)
 					r.Delete("/service-principals/{principalId}/tokens/{tokenId}", h.RevokeServiceToken)
 				})

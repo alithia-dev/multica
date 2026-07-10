@@ -41,7 +41,10 @@ func (q *Queries) GetServiceTokenAuth(ctx context.Context, tokenHash string) (Ge
 }
 
 const updateServiceTokenLastUsed = `-- name: UpdateServiceTokenLastUsed :exec
-UPDATE service_token SET last_used_at = now() WHERE id = $1
+UPDATE service_token
+SET last_used_at = now()
+WHERE id = $1
+  AND (last_used_at IS NULL OR last_used_at < now() - INTERVAL '5 minutes')
 `
 
 func (q *Queries) UpdateServiceTokenLastUsed(ctx context.Context, id pgtype.UUID) error {

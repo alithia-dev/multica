@@ -8,4 +8,7 @@ WHERE st.token_hash = $1
   AND sp.disabled = FALSE;
 
 -- name: UpdateServiceTokenLastUsed :exec
-UPDATE service_token SET last_used_at = now() WHERE id = $1;
+UPDATE service_token
+SET last_used_at = now()
+WHERE id = $1
+  AND (last_used_at IS NULL OR last_used_at < now() - INTERVAL '5 minutes');
