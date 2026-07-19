@@ -130,6 +130,27 @@ func (h *Handler) CreateServiceAccountToken(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, 201, map[string]any{"id": uuidToString(t.ID), "service_account_id": uuidToString(t.ServiceAccountID), "name": t.Name, "token_prefix": t.TokenPrefix, "expires_at": timestampToPtr(t.ExpiresAt), "token": raw})
 }
 
+func (h *Handler) RevokeServiceAccount(w http.ResponseWriter, r *http.Request) {
+	wsID := h.resolveWorkspaceID(r)
+	if _, ok := h.requireWorkspaceRole(w, r, wsID, "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+	aID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "service account id")
+	if !ok {
+		return
+	}
+	// Treat an already-revoked or unknown account as revoked. The workspace
+	// predicate prevents an administrator from affecting another workspace.
+	if _, err := h.Queries.RevokeServiceAccount(r.Context(), db.RevokeServiceAccountParams{
+		ID:          aID,
+		WorkspaceID: parseUUID(wsID),
+	}); err != nil {
+		writeError(w, 500, "failed to revoke service account")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) RevokeServiceAccountToken(w http.ResponseWriter, r *http.Request) {
 	wsID := h.resolveWorkspaceID(r)
 	if _, ok := h.requireWorkspaceRole(w, r, wsID, "workspace not found", "owner", "admin"); !ok {

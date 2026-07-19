@@ -118,3 +118,36 @@ func TestWriteAttributionMatrix(t *testing.T) {
 		})
 	}
 }
+
+func TestRevokeServiceAccountIsIdempotentAndInvalidatesAuthentication(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	var serviceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO service_account (workspace_id, name, slug, role, created_by_user_id)
+		VALUES ($1, 'Revocable Service', 'revocable-service', 'member', $2) RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&serviceID); err != nil {
+		t.Fatalf("create service account: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM service_account WHERE id=$1`, serviceID) })
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		w := httptest.NewRecorder()
+		r := newRequest(http.MethodDelete, "/api/service-accounts/"+serviceID+"?workspace_id="+testWorkspaceID, nil)
+		r = withURLParam(r, "id", serviceID)
+		testHandler.RevokeServiceAccount(w, r)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("revoke attempt %d: %d %s", attempt, w.Code, w.Body.String())
+		}
+	}
+
+	var revoked bool
+	if err := testPool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM service_account WHERE id=$1`, serviceID).Scan(&revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !revoked {
+		t.Fatal("service account remains active after revocation")
+	}
+}

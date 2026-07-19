@@ -12,12 +12,13 @@ import (
 var serviceAccountCmd = &cobra.Command{Use: "service-account", Short: "Manage workspace service accounts"}
 var serviceAccountListCmd = &cobra.Command{Use: "list", Args: exactArgs(0), RunE: runServiceAccountList}
 var serviceAccountCreateCmd = &cobra.Command{Use: "create", Args: exactArgs(0), RunE: runServiceAccountCreate}
+var serviceAccountRevokeCmd = &cobra.Command{Use: "revoke <service-account-id>", Args: exactArgs(1), RunE: runServiceAccountRevoke}
 var serviceAccountTokenCmd = &cobra.Command{Use: "token", Short: "Manage service-account tokens"}
 var serviceAccountTokenCreateCmd = &cobra.Command{Use: "create <service-account-id>", Args: exactArgs(1), RunE: runServiceAccountTokenCreate}
 var serviceAccountTokenRevokeCmd = &cobra.Command{Use: "revoke <service-account-id> <token-id>", Args: exactArgs(2), RunE: runServiceAccountTokenRevoke}
 
 func init() {
-	serviceAccountCmd.AddCommand(serviceAccountListCmd, serviceAccountCreateCmd, serviceAccountTokenCmd)
+	serviceAccountCmd.AddCommand(serviceAccountListCmd, serviceAccountCreateCmd, serviceAccountRevokeCmd, serviceAccountTokenCmd)
 	serviceAccountTokenCmd.AddCommand(serviceAccountTokenCreateCmd, serviceAccountTokenRevokeCmd)
 	serviceAccountCreateCmd.Flags().String("name", "", "Display name (required)")
 	serviceAccountCreateCmd.Flags().String("slug", "", "Workspace-unique slug (required)")
@@ -87,6 +88,16 @@ func runServiceAccountTokenCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	return cli.PrintJSON(os.Stdout, out)
+}
+
+func runServiceAccountRevoke(cmd *cobra.Command, args []string) error {
+	c, ctx, cancel, err := serviceAccountClient(cmd)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	path := "/api/service-accounts/" + args[0] + "?workspace_id=" + c.WorkspaceID
+	return c.DeleteJSON(ctx, path)
 }
 
 func runServiceAccountTokenRevoke(cmd *cobra.Command, args []string) error {
