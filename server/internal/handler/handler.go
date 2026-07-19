@@ -662,6 +662,9 @@ func (h *Handler) requireWorkspaceMember(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
 		return db.Member{}, false
 	}
+	if member, ok := ctxMember(r.Context()); ok && ctxWorkspaceID(r.Context()) == workspaceID {
+		return member, true
+	}
 
 	userID, ok := requireUserID(w, r)
 	if !ok {

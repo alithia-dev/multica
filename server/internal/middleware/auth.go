@@ -167,8 +167,9 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 					return
 				}
-				r.Header.Set("X-User-ID", uuidToString(st.CreatedByUserID))
+				r.Header.Set("X-User-ID", uuidToString(st.ServiceAccountID))
 				r.Header.Set("X-Service-Account-ID", uuidToString(st.ServiceAccountID))
+				r.Header.Set("X-Service-Account-Role", st.Role)
 				r.Header.Set("X-Workspace-ID", uuidToString(st.WorkspaceID))
 				r.Header.Set("X-Actor-Source", "service_account")
 				go queries.UpdateServiceAccountTokenLastUsed(context.Background(), st.ID)

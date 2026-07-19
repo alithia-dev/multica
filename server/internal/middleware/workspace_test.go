@@ -33,6 +33,58 @@ func openPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+func TestRequireWorkspaceRole_ServiceAccountUsesOwnRoleAndWorkspace(t *testing.T) {
+	serviceID := "00000000-0000-0000-0000-000000000088"
+	workspaceID := "00000000-0000-0000-0000-000000000077"
+	request := func(role, requestedWorkspace string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/issues?workspace_id="+requestedWorkspace, nil)
+		r.Header.Set("X-Actor-Source", "service_account")
+		r.Header.Set("X-User-ID", serviceID)
+		r.Header.Set("X-Service-Account-ID", serviceID)
+		r.Header.Set("X-Service-Account-Role", role)
+		r.Header.Set("X-Workspace-ID", workspaceID)
+		return r
+	}
+
+	t.Run("admin service is authorized without creator membership", func(t *testing.T) {
+		called := false
+		next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			called = true
+			member, ok := MemberFromContext(r.Context())
+			if !ok || member.Role != "admin" || member.UserID != member.ID {
+				t.Fatalf("service member context = %+v, ok=%v", member, ok)
+			}
+		})
+		w := httptest.NewRecorder()
+		RequireWorkspaceRole(nil, "admin")(next).ServeHTTP(w, request("admin", workspaceID))
+		if w.Code != http.StatusOK || !called {
+			t.Fatalf("status=%d called=%v body=%s", w.Code, called, w.Body.String())
+		}
+	})
+
+	t.Run("member service cannot inherit creator admin", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		RequireWorkspaceRole(nil, "admin")(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("must not run") })).ServeHTTP(w, request("member", workspaceID))
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status=%d want 403", w.Code)
+		}
+	})
+
+	t.Run("service cannot widen workspace", func(t *testing.T) {
+		called := false
+		w := httptest.NewRecorder()
+		RequireWorkspaceMember(nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			called = true
+			if got := WorkspaceIDFromContext(r.Context()); got != workspaceID {
+				t.Fatalf("workspace=%s want bound %s", got, workspaceID)
+			}
+		})).ServeHTTP(w, request("admin", "00000000-0000-0000-0000-000000000066"))
+		if w.Code != http.StatusOK || !called {
+			t.Fatalf("status=%d called=%v", w.Code, called)
+		}
+	})
+}
+
 // setupResolverFixture inserts a workspace with a known slug and returns its
 // UUID. The caller is responsible for calling the returned cleanup func.
 func setupResolverFixture(t *testing.T, pool *pgxpool.Pool) (workspaceID string, cleanup func()) {

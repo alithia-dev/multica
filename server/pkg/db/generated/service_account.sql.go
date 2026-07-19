@@ -109,7 +109,7 @@ func (q *Queries) GetServiceAccount(ctx context.Context, id pgtype.UUID) (Servic
 }
 
 const getServiceAccountTokenByHash = `-- name: GetServiceAccountTokenByHash :one
-SELECT t.id, t.service_account_id, t.expires_at, s.workspace_id, s.created_by_user_id
+SELECT t.id, t.service_account_id, t.expires_at, s.workspace_id, s.role
 FROM service_account_token t JOIN service_account s ON s.id = t.service_account_id
 WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND s.revoked_at IS NULL
   AND (t.expires_at IS NULL OR t.expires_at > now())
@@ -120,7 +120,7 @@ type GetServiceAccountTokenByHashRow struct {
 	ServiceAccountID pgtype.UUID        `json:"service_account_id"`
 	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
 	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
-	CreatedByUserID  pgtype.UUID        `json:"created_by_user_id"`
+	Role             string             `json:"role"`
 }
 
 func (q *Queries) GetServiceAccountTokenByHash(ctx context.Context, tokenHash string) (GetServiceAccountTokenByHashRow, error) {
@@ -131,7 +131,7 @@ func (q *Queries) GetServiceAccountTokenByHash(ctx context.Context, tokenHash st
 		&i.ServiceAccountID,
 		&i.ExpiresAt,
 		&i.WorkspaceID,
-		&i.CreatedByUserID,
+		&i.Role,
 	)
 	return i, err
 }

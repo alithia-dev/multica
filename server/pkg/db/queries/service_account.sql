@@ -17,7 +17,7 @@ INSERT INTO service_account_token (service_account_id, name, token_hash, token_p
 VALUES ($1, $2, $3, $4, $5) RETURNING *;
 
 -- name: GetServiceAccountTokenByHash :one
-SELECT t.id, t.service_account_id, t.expires_at, s.workspace_id, s.created_by_user_id
+SELECT t.id, t.service_account_id, t.expires_at, s.workspace_id, s.role
 FROM service_account_token t JOIN service_account s ON s.id = t.service_account_id
 WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND s.revoked_at IS NULL
   AND (t.expires_at IS NULL OR t.expires_at > now());

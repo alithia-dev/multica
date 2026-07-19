@@ -2899,6 +2899,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 
 	// Determine actor identity: agent (via X-Agent-ID header) or member.
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	h.recordIssueUpdateActivities(r, issue, actorType, actorID, statusChanged, assigneeChanged, prevIssue)
 
 	h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, map[string]any{
 		"issue":               resp,
@@ -2961,6 +2962,29 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) recordIssueUpdateActivities(r *http.Request, issue db.Issue, actorType, actorID string, statusChanged, assigneeChanged bool, previous db.Issue) {
+	actorUUID, err := util.ParseUUID(actorID)
+	if err != nil {
+		slog.Error("issue update activity has invalid actor", "actor_type", actorType, "actor_id", actorID, "error", err)
+		return
+	}
+	record := func(action string, details map[string]any) {
+		payload, err := json.Marshal(details)
+		if err != nil {
+			return
+		}
+		if _, err := h.Queries.CreateActivity(r.Context(), db.CreateActivityParams{WorkspaceID: issue.WorkspaceID, IssueID: issue.ID, ActorType: pgtype.Text{String: actorType, Valid: true}, ActorID: actorUUID, Action: action, Details: payload}); err != nil {
+			slog.Error("failed to record issue update activity", "issue_id", uuidToString(issue.ID), "action", action, "error", err)
+		}
+	}
+	if statusChanged {
+		record("status_changed", map[string]any{"from": previous.Status, "to": issue.Status})
+	}
+	if assigneeChanged {
+		record("assignee_changed", map[string]any{"from_type": textToPtr(previous.AssigneeType), "from_id": uuidToPtr(previous.AssigneeID), "to_type": textToPtr(issue.AssigneeType), "to_id": uuidToPtr(issue.AssigneeID)})
+	}
 }
 
 // validateAssigneePair verifies the (assignee_type, assignee_id) pair refers
