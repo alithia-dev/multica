@@ -137,10 +137,7 @@ func TestRevokeServiceAccountIsIdempotentAndInvalidatesAuthentication(t *testing
 	`, testWorkspaceID, testUserID).Scan(&serviceID); err != nil {
 		t.Fatalf("create service account: %v", err)
 	}
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM service_account_token WHERE service_account_id=$1`, serviceID)
-		testPool.Exec(context.Background(), `DELETE FROM service_account WHERE id=$1`, serviceID)
-	})
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM service_account WHERE id=$1`, serviceID) })
 
 	rawTokens := []string{"msa_revoke_one", "msa_revoke_two"}
 	for i, raw := range rawTokens {
@@ -155,12 +152,6 @@ func TestRevokeServiceAccountIsIdempotentAndInvalidatesAuthentication(t *testing
 	for attempt := 1; attempt <= 2; attempt++ {
 		w := httptest.NewRecorder()
 		r := newRequest(http.MethodDelete, "/api/service-accounts/"+serviceID+"?workspace_id="+testWorkspaceID, nil)
-		r.Header.Set("X-Actor-Source", "service_account")
-		r.Header.Set("X-Service-Account-ID", serviceID)
-		r.Header.Set("X-Service-Account-Role", "member")
-		r.Header.Set("X-User-ID", serviceID)
-		member := db.Member{ID: parseUUID(serviceID), UserID: parseUUID(serviceID), WorkspaceID: parseUUID(testWorkspaceID), Role: "member"}
-		r = r.WithContext(middleware.SetMemberContext(r.Context(), testWorkspaceID, member))
 		r = withURLParam(r, "id", serviceID)
 		testHandler.RevokeServiceAccount(w, r)
 		if w.Code != http.StatusNoContent {

@@ -132,15 +132,12 @@ func (h *Handler) CreateServiceAccountToken(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) RevokeServiceAccount(w http.ResponseWriter, r *http.Request) {
 	wsID := h.resolveWorkspaceID(r)
+	if _, ok := h.requireWorkspaceRole(w, r, wsID, "workspace not found", "owner", "admin"); !ok {
+		return
+	}
 	aID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "service account id")
 	if !ok {
 		return
-	}
-	self := r.Header.Get("X-Actor-Source") == "service_account" && r.Header.Get("X-Service-Account-ID") == uuidToString(aID)
-	if !self {
-		if _, ok := h.requireWorkspaceRole(w, r, wsID, "workspace not found", "owner", "admin"); !ok {
-			return
-		}
 	}
 	// Treat an already-revoked or unknown account as revoked. The workspace
 	// predicate prevents an administrator from affecting another workspace.
