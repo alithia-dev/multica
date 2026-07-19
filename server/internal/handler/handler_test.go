@@ -3026,6 +3026,27 @@ func TestResolveActor(t *testing.T) {
 	}
 }
 
+// TestResolveActor_ServiceAccountFallback pins fail-safe service attribution.
+func TestResolveActor_ServiceAccountFallback(t *testing.T) {
+	serviceID := "00000000-0000-0000-0000-000000000088"
+	req := newRequest("GET", "/test", nil)
+	req.Header.Set("X-Actor-Source", "service_account")
+	req.Header.Set("X-Service-Account-ID", serviceID)
+
+	actorType, actorID := testHandler.resolveActor(req, testUserID, testWorkspaceID)
+	if actorType != "service_account" || actorID != serviceID {
+		t.Fatalf("service fallback = (%q, %q), want (service_account, %q)", actorType, actorID, serviceID)
+	}
+
+	// An incomplete agent claim remains attributed to the service, never the
+	// creating human and never the claimed agent.
+	req.Header.Set("X-Agent-ID", "00000000-0000-0000-0000-000000000099")
+	actorType, actorID = testHandler.resolveActor(req, testUserID, testWorkspaceID)
+	if actorType != "service_account" || actorID != serviceID {
+		t.Fatalf("invalid agent fallback = (%q, %q), want (service_account, %q)", actorType, actorID, serviceID)
+	}
+}
+
 // TestBacklogNoTriggerOnCreate verifies that creating a backlog issue with an
 // agent assignee does NOT enqueue a task — backlog is a parking lot.
 func TestBacklogNoTriggerOnCreate(t *testing.T) {

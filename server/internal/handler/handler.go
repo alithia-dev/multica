@@ -526,44 +526,51 @@ func requestUserID(r *http.Request) string {
 // review). The daemon always pairs the two headers, so requiring both has
 // no effect on legitimate agent callers but closes the impersonation path.
 //
-// Returns ("agent", agentID) on success, ("member", userID) otherwise.
+// Returns ("agent", agentID) on valid task attribution. Otherwise it returns
+// the authenticated principal: service_account for msa_ tokens, member for
+// human JWT/PAT traffic. Invalid agent headers therefore never relabel a
+// service operation as the creating human.
 func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (actorType, actorID string) {
 	if r.Header.Get("X-Actor-Source") == "task_token" {
 		// Server-set header — auth middleware also forced X-Agent-ID
 		// from the token row. Trust it directly without re-querying.
 		return "agent", r.Header.Get("X-Agent-ID")
 	}
+	fallbackType, fallbackID := "member", userID
+	if r.Header.Get("X-Actor-Source") == "service_account" {
+		fallbackType, fallbackID = "service_account", r.Header.Get("X-Service-Account-ID")
+	}
 	agentID := r.Header.Get("X-Agent-ID")
 	if agentID == "" {
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 	taskID := r.Header.Get("X-Task-ID")
 	if taskID == "" {
 		slog.Debug("resolveActor: X-Agent-ID present but X-Task-ID missing, refusing to trust agent identity", "agent_id", agentID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 
 	agentUUID, err := util.ParseUUID(agentID)
 	if err != nil {
 		slog.Debug("resolveActor: X-Agent-ID is not a valid UUID, falling back to member", "agent_id", agentID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 	// Validate the agent exists in the target workspace.
 	agent, err := h.Queries.GetAgent(r.Context(), agentUUID)
 	if err != nil || uuidToString(agent.WorkspaceID) != workspaceID {
 		slog.Debug("resolveActor: X-Agent-ID rejected, agent not found or workspace mismatch", "agent_id", agentID, "workspace_id", workspaceID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 
 	taskUUID, err := util.ParseUUID(taskID)
 	if err != nil {
 		slog.Debug("resolveActor: X-Task-ID is not a valid UUID, falling back to member", "task_id", taskID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
 	if err != nil || uuidToString(task.AgentID) != agentID {
 		slog.Debug("resolveActor: X-Task-ID rejected, task not found or agent mismatch", "agent_id", agentID, "task_id", taskID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 
 	return "agent", agentID

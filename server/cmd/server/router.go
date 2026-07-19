@@ -1091,6 +1091,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				})
 			})
 
+			r.Route("/api/service-accounts", func(r chi.Router) {
+				r.Get("/", h.ListServiceAccounts)
+				r.Post("/", h.CreateServiceAccount)
+				r.Post("/{id}/tokens", h.CreateServiceAccountToken)
+				r.Delete("/{id}/tokens/{tokenId}", h.RevokeServiceAccountToken)
+			})
+
 			// Labels
 			r.Route("/api/labels", func(r chi.Router) {
 				r.Get("/", h.ListLabels)

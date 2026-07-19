@@ -37,6 +37,16 @@ func GeneratePATToken() (string, error) {
 	return "mul_" + hex.EncodeToString(b), nil
 }
 
+// GenerateServiceAccountToken creates a machine credential whose prefix is
+// unambiguous at the authentication boundary.
+func GenerateServiceAccountToken() (string, error) {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "msa_" + hex.EncodeToString(b), nil
+}
+
 // GenerateDaemonToken creates a new daemon auth token: "mdt_" + 40 random hex chars.
 func GenerateDaemonToken() (string, error) {
 	b := make([]byte, 20) // 20 bytes = 40 hex chars

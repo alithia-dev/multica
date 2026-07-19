@@ -59,6 +59,9 @@ func TestRequireHumanActor_BlocksMachineCredentials(t *testing.T) {
 		// of machine credential as mat_ for billing-authorization
 		// purposes.
 		{name: "cloud_pat", actorSource: "cloud_pat"},
+		// msa_ service token — orchestration is a machine principal and must
+		// not inherit the creating user's account-level privileges.
+		{name: "service_account", actorSource: "service_account"},
 	}
 
 	for _, tc := range cases {
@@ -132,7 +135,6 @@ func TestRequireHumanActor_IgnoresUnknownActorSource(t *testing.T) {
 		t.Fatal("inner handler must run for unknown actor sources")
 	}
 }
-
 
 // TestRequireHumanActor_AppliedViaChiRouterUse pins the wiring side of
 // the contract: when the guard is attached to a chi route group via

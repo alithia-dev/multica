@@ -74,6 +74,16 @@ export interface MemberWithUser {
   avatar_url: string | null;
 }
 
+export interface ServiceAccount {
+  id: string;
+  workspace_id: string;
+  name: string;
+  slug: string;
+  avatar_url: string | null;
+  role: "admin" | "member";
+  created_at: string;
+}
+
 export interface Invitation {
   id: string;
   workspace_id: string;

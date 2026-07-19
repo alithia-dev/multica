@@ -806,6 +806,31 @@ type RuntimeProfile struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ServiceAccount struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	Name            string             `json:"name"`
+	Slug            string             `json:"slug"`
+	AvatarUrl       pgtype.Text        `json:"avatar_url"`
+	Role            string             `json:"role"`
+	CreatedByUserID pgtype.UUID        `json:"created_by_user_id"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ServiceAccountToken struct {
+	ID               pgtype.UUID        `json:"id"`
+	ServiceAccountID pgtype.UUID        `json:"service_account_id"`
+	Name             string             `json:"name"`
+	TokenHash        string             `json:"token_hash"`
+	TokenPrefix      string             `json:"token_prefix"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	LastUsedAt       pgtype.Timestamptz `json:"last_used_at"`
+	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type Skill struct {
 	ID          pgtype.UUID        `json:"id"`
 	WorkspaceID pgtype.UUID        `json:"workspace_id"`

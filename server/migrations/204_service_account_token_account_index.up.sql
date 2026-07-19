@@ -1,0 +1,1 @@
+CREATE INDEX CONCURRENTLY idx_service_account_token_account ON service_account_token(service_account_id) WHERE revoked_at IS NULL;

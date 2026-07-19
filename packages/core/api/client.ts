@@ -41,6 +41,7 @@ import type {
   Workspace,
   WorkspaceRepo,
   MemberWithUser,
+  ServiceAccount,
   User,
   Skill,
   SkillSummary,
@@ -1752,6 +1753,10 @@ export class ApiClient {
   // Members
   async listMembers(workspaceId: string): Promise<MemberWithUser[]> {
     return this.fetch(`/api/workspaces/${workspaceId}/members`);
+  }
+
+  async listServiceAccounts(workspaceId: string): Promise<ServiceAccount[]> {
+    return this.fetch(`/api/service-accounts?workspace_id=${encodeURIComponent(workspaceId)}`);
   }
 
   async createMember(workspaceId: string, data: CreateMemberRequest): Promise<Invitation> {
