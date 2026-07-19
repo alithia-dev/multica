@@ -3,10 +3,13 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -28,7 +31,10 @@ func TestWriteAttributionMatrix(t *testing.T) {
 	`, testWorkspaceID, testUserID).Scan(&serviceID); err != nil {
 		t.Fatalf("create service account: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM service_account WHERE id=$1`, serviceID) })
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM service_account_token WHERE service_account_id=$1`, serviceID)
+		testPool.Exec(context.Background(), `DELETE FROM service_account WHERE id=$1`, serviceID)
+	})
 
 	agentID := createHandlerTestAgent(t, "service-attribution-matrix-agent", nil)
 	var taskID string
@@ -133,6 +139,16 @@ func TestRevokeServiceAccountIsIdempotentAndInvalidatesAuthentication(t *testing
 	}
 	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM service_account WHERE id=$1`, serviceID) })
 
+	rawTokens := []string{"msa_revoke_one", "msa_revoke_two"}
+	for i, raw := range rawTokens {
+		if _, err := testPool.Exec(ctx, `INSERT INTO service_account_token (service_account_id,name,token_hash,token_prefix) VALUES ($1,$2,$3,$4)`, serviceID, "token", auth.HashToken(raw), raw[:12]); err != nil {
+			t.Fatalf("create token %d: %v", i, err)
+		}
+		if _, err := testHandler.Queries.GetServiceAccountTokenByHash(ctx, auth.HashToken(raw)); err != nil {
+			t.Fatalf("token %d not initially valid: %v", i, err)
+		}
+	}
+
 	for attempt := 1; attempt <= 2; attempt++ {
 		w := httptest.NewRecorder()
 		r := newRequest(http.MethodDelete, "/api/service-accounts/"+serviceID+"?workspace_id="+testWorkspaceID, nil)
@@ -149,5 +165,10 @@ func TestRevokeServiceAccountIsIdempotentAndInvalidatesAuthentication(t *testing
 	}
 	if !revoked {
 		t.Fatal("service account remains active after revocation")
+	}
+	for i, raw := range rawTokens {
+		if _, err := testHandler.Queries.GetServiceAccountTokenByHash(ctx, auth.HashToken(raw)); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("token %d remains accepted after account revocation: %v", i, err)
+		}
 	}
 }
