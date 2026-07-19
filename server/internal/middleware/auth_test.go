@@ -48,7 +48,7 @@ func newRedisTestClient(t *testing.T) *redis.Client {
 
 func TestAuth_ServiceAccountStampsIndependentPrincipal(t *testing.T) {
 	pool := openPool(t)
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	ctx := context.Background()
 	var userID, workspaceID, serviceID string
 	if err := pool.QueryRow(ctx, `INSERT INTO "user" (name,email) VALUES ('Service Creator','service-auth-test@multica.test') RETURNING id`).Scan(&userID); err != nil {
@@ -61,10 +61,13 @@ func TestAuth_ServiceAccountStampsIndependentPrincipal(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		pool.Exec(context.Background(), `DELETE FROM service_account_token WHERE service_account_id=$1`, serviceID)
-		pool.Exec(context.Background(), `DELETE FROM service_account WHERE id=$1`, serviceID)
-		pool.Exec(context.Background(), `DELETE FROM workspace WHERE id=$1`, workspaceID)
-		pool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID)
+		cleanupCtx := context.Background()
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM workspace WHERE id=$1`, workspaceID); err != nil {
+			t.Errorf("delete service auth workspace fixture: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM "user" WHERE id=$1`, userID); err != nil {
+			t.Errorf("delete service auth user fixture: %v", err)
+		}
 	})
 	raw, err := auth.GenerateServiceAccountToken()
 	if err != nil {
@@ -94,7 +97,7 @@ func TestAuth_ServiceAccountStampsIndependentPrincipal(t *testing.T) {
 
 func TestAuth_ServiceAccountWorkspaceDeletionRevokesToken(t *testing.T) {
 	pool := openPool(t)
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	ctx := context.Background()
 	var userID, workspaceID, serviceID string
 	if err := pool.QueryRow(ctx, `INSERT INTO "user" (name,email) VALUES ('Lifecycle Creator','service-lifecycle-test@multica.test') RETURNING id`).Scan(&userID); err != nil {
@@ -107,8 +110,13 @@ func TestAuth_ServiceAccountWorkspaceDeletionRevokesToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		pool.Exec(context.Background(), `DELETE FROM workspace WHERE id=$1`, workspaceID)
-		pool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID)
+		cleanupCtx := context.Background()
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM workspace WHERE id=$1`, workspaceID); err != nil {
+			t.Errorf("delete service lifecycle workspace fixture: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM "user" WHERE id=$1`, userID); err != nil {
+			t.Errorf("delete service lifecycle user fixture: %v", err)
+		}
 	})
 	raw, err := auth.GenerateServiceAccountToken()
 	if err != nil {
