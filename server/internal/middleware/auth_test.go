@@ -92,6 +92,58 @@ func TestAuth_ServiceAccountStampsIndependentPrincipal(t *testing.T) {
 	}
 }
 
+func TestAuth_ServiceAccountWorkspaceDeletionRevokesToken(t *testing.T) {
+	pool := openPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+	var userID, workspaceID, serviceID string
+	if err := pool.QueryRow(ctx, `INSERT INTO "user" (name,email) VALUES ('Lifecycle Creator','service-lifecycle-test@multica.test') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workspace (name,slug,issue_prefix) VALUES ('Service Lifecycle Test','service-lifecycle-test','SLT') RETURNING id`).Scan(&workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO service_account (workspace_id,name,slug,role,created_by_user_id) VALUES ($1,'Lifecycle Service','lifecycle-service','member',$2) RETURNING id`, workspaceID, userID).Scan(&serviceID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DELETE FROM workspace WHERE id=$1`, workspaceID)
+		pool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID)
+	})
+	raw, err := auth.GenerateServiceAccountToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO service_account_token (service_account_id,name,token_hash,token_prefix) VALUES ($1,'lifecycle',$2,$3)`, serviceID, auth.HashToken(raw), raw[:12]); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM workspace WHERE id=$1`, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	var accountCount, tokenCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM service_account WHERE id=$1`, serviceID).Scan(&accountCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM service_account_token WHERE service_account_id=$1`, serviceID).Scan(&tokenCount); err != nil {
+		t.Fatal(err)
+	}
+	if accountCount != 0 || tokenCount != 0 {
+		t.Fatalf("workspace deletion left service rows: accounts=%d tokens=%d", accountCount, tokenCount)
+	}
+
+	handler := Auth(db.New(pool), nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("deleted workspace token reached authenticated handler")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/issues", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", w.Code, w.Body.String())
+	}
+}
+
 func generateToken(claims jwt.MapClaims, secret []byte) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	s, _ := token.SignedString(secret)
