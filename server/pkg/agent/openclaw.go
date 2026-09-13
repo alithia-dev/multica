@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -72,6 +73,59 @@ const openclawReadbackStartedMessage = "Readback/replay phase started.\n"
 const openclawFinalizingMessage = "Finalizing the requested run.\n"
 const openclawCompletedMessage = "GRIT finished the requested run successfully; the final result was delivered.\n"
 const openclawFailedMessage = "GRIT finished the requested run with an error; the final result was preserved.\n"
+const openclawCitizenStartedMessage = "Starting the requested run: the assigned OpenClaw citizen will execute the task and deliver its final result.\n"
+const openclawCitizenCompletedMessage = "The assigned OpenClaw citizen finished the requested run successfully; the final result was delivered.\n"
+const openclawCitizenFailedMessage = "The assigned OpenClaw citizen finished the requested run with an error; the final result was preserved.\n"
+
+type openclawProgressMessages struct {
+	started   string
+	completed string
+	failed    string
+}
+
+// openclawProgressMessagesForExecution keeps main-agent and citizen reporting
+// truthful without interpolating a user-controlled agent name. The daemon-owned
+// Multica identity is authoritative when present; direct backend callers fall
+// back to the OpenClaw --agent selection parsed only before --message, so prompt
+// text can never affect identity.
+func openclawProgressMessagesForExecution(opts ExecOptions, args []string) openclawProgressMessages {
+	agentID := strings.TrimSpace(opts.AgentName)
+	identityFromMultica := agentID != ""
+	if !identityFromMultica {
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			if arg == "--message" || strings.HasPrefix(arg, "--message=") {
+				break
+			}
+			if arg == "--agent" && i+1 < len(args) {
+				i++
+				agentID = args[i]
+				continue
+			}
+			if strings.HasPrefix(arg, "--agent=") {
+				agentID = strings.TrimPrefix(arg, "--agent=")
+			}
+		}
+	}
+	if identityFromMultica {
+		if strings.EqualFold(agentID, "grit") {
+			return openclawProgressMessages{
+				started: openclawStartedMessage, completed: openclawCompletedMessage, failed: openclawFailedMessage,
+			}
+		}
+		return openclawProgressMessages{
+			started: openclawCitizenStartedMessage, completed: openclawCitizenCompletedMessage, failed: openclawCitizenFailedMessage,
+		}
+	}
+	if agentID == "" || strings.EqualFold(agentID, "main") || strings.EqualFold(agentID, "grit") {
+		return openclawProgressMessages{
+			started: openclawStartedMessage, completed: openclawCompletedMessage, failed: openclawFailedMessage,
+		}
+	}
+	return openclawProgressMessages{
+		started: openclawCitizenStartedMessage, completed: openclawCitizenCompletedMessage, failed: openclawCitizenFailedMessage,
+	}
+}
 
 // openclawVersionPattern extracts a three-segment dotted version from
 // arbitrary `openclaw --version` output (e.g. "openclaw 2026.5.5",
@@ -121,6 +175,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	args := buildOpenclawArgs(prompt, sessionID, opts, b.cfg.Logger)
 	progressDelivery := parseOpenclawProgressDelivery(args)
+	progressMessages := openclawProgressMessagesForExecution(opts, args)
 
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
@@ -166,10 +221,10 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
-	trySend(msgCh, Message{Type: MessageText, Content: openclawStartedMessage})
+	trySend(msgCh, Message{Type: MessageText, Content: progressMessages.started})
 	phaseCh := make(chan string, 16)
 	progressDone := make(chan struct{})
-	go b.streamSafeProgress(runCtx, msgCh, progressDone, phaseCh, execPath, opts.Cwd, progressDelivery)
+	go b.streamSafeProgress(runCtx, msgCh, progressDone, phaseCh, execPath, opts.Cwd, progressDelivery, progressMessages.started)
 
 	// Close stdout when the context is cancelled so the scanner unblocks.
 	go func() {
@@ -253,9 +308,9 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 		b.cfg.Logger.Info("openclaw finished", "pid", cmd.Process.Pid, "status", scanResult.status, "duration", duration.Round(time.Millisecond).String())
 		if runCtx.Err() == nil {
-			completion := openclawCompletedMessage
+			completion := progressMessages.completed
 			if scanResult.status != "completed" {
-				completion = openclawFailedMessage
+				completion = progressMessages.failed
 			}
 			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, completion)
 		}
@@ -295,7 +350,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 // streamSafeProgress keeps final-result-only OpenClaw runs observable without
 // inventing work. Named phases require explicit lifecycle evidence from the
 // subprocess. A silent backend receives one throttled, truthful heartbeat.
-func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}, phases <-chan string, execPath, cwd string, delivery *openclawProgressDelivery) {
+func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}, phases <-chan string, execPath, cwd string, delivery *openclawProgressDelivery, startedMessage string) {
 	defer close(done)
 
 	cadence := b.progressCadence
@@ -303,7 +358,7 @@ func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Mess
 		cadence = openclawProgressCadence
 	}
 
-	b.deliverSafeProgress(ctx, execPath, cwd, delivery, openclawStartedMessage)
+	b.deliverSafeProgress(ctx, execPath, cwd, delivery, startedMessage)
 	seen := make(map[string]struct{})
 	waitingEmitted := false
 	ticker := time.NewTicker(cadence)
@@ -464,7 +519,10 @@ func (b *openclawBackend) deliverSafeProgress(ctx context.Context, execPath, cwd
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
-		b.cfg.Logger.Warn("openclaw progress delivery failed", "channel", delivery.channel, "error", err)
+		b.cfg.Logger.Warn("openclaw progress delivery failed",
+			"channel", delivery.channel,
+			"error_bytes", len(err.Error()),
+		)
 	}
 }
 

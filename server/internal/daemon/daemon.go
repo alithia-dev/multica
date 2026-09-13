@@ -8611,6 +8611,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if providerNeedsInlineSystemPrompt(provider) {
 		execOpts.SystemPrompt = runtimeBrief
 	}
+	if provider == "openclaw" {
+		execOpts.AgentName = task.Agent.Name
+	}
 
 	// A quick-actions refresh task from a server that predates server-side
 	// generation (MUL-5573). This daemon no longer has a suggestion pass to run

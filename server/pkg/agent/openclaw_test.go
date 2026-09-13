@@ -1646,6 +1646,9 @@ func TestOpenclawProgressUsesOnlyRedactionSafeConstants(t *testing.T) {
 		openclawFinalizingMessage,
 		openclawCompletedMessage,
 		openclawFailedMessage,
+		openclawCitizenStartedMessage,
+		openclawCitizenCompletedMessage,
+		openclawCitizenFailedMessage,
 	}
 	for _, message := range messages {
 		for _, forbidden := range []string{"token", "credential", "transaction", "prompt", "tool", "/home/", `c:\\`} {
@@ -1871,6 +1874,102 @@ func TestParseOpenclawProgressDelivery(t *testing.T) {
 				t.Fatalf("got %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestOpenclawProgressMessagesFollowSelectedAgentIdentity(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		opts        ExecOptions
+		args        []string
+		wantStarted string
+		wantDone    string
+		wantFailed  string
+	}{
+		{name: "implicit main", args: []string{"agent", "--message", "task"}, wantStarted: openclawStartedMessage, wantDone: openclawCompletedMessage, wantFailed: openclawFailedMessage},
+		{name: "explicit OpenClaw main", args: []string{"agent", "--agent", "main", "--message", "task"}, wantStarted: openclawStartedMessage, wantDone: openclawCompletedMessage, wantFailed: openclawFailedMessage},
+		{name: "Multica GRIT", opts: ExecOptions{AgentName: "GRIT"}, args: []string{"agent", "--agent=forge", "--message", "task"}, wantStarted: openclawStartedMessage, wantDone: openclawCompletedMessage, wantFailed: openclawFailedMessage},
+		{name: "Multica citizen", opts: ExecOptions{AgentName: "FORGE"}, args: []string{"agent", "--agent", "main", "--message", "task"}, wantStarted: openclawCitizenStartedMessage, wantDone: openclawCitizenCompletedMessage, wantFailed: openclawCitizenFailedMessage},
+		{name: "OpenClaw citizen fallback", args: []string{"agent", "--agent", "forge", "--message", "task"}, wantStarted: openclawCitizenStartedMessage, wantDone: openclawCitizenCompletedMessage, wantFailed: openclawCitizenFailedMessage},
+		{name: "prompt cannot select citizen", args: []string{"agent", "--message", "--agent forge"}, wantStarted: openclawStartedMessage, wantDone: openclawCompletedMessage, wantFailed: openclawFailedMessage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := openclawProgressMessagesForExecution(tc.opts, tc.args)
+			if got.started != tc.wantStarted || got.completed != tc.wantDone || got.failed != tc.wantFailed {
+				t.Fatalf("progress messages = %+v, want started=%q completed=%q failed=%q", got, tc.wantStarted, tc.wantDone, tc.wantFailed)
+			}
+		})
+	}
+}
+
+func TestOpenclawCitizenExecutionUsesCitizenProgress(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+printf '%s\n' '{"payloads":[{"text":"citizen final"}],"meta":{"durationMs":1}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{cfg: Config{ExecutablePath: fakePath, Logger: slog.Default()}}
+	session, err := b.Execute(context.Background(), "task", ExecOptions{AgentName: "FORGE"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var contents []string
+	for msg := range session.Messages {
+		contents = append(contents, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "citizen final" {
+		t.Fatalf("result = %+v", result)
+	}
+	for _, want := range []string{openclawCitizenStartedMessage, openclawFinalizingMessage, openclawCitizenCompletedMessage} {
+		if !containsOpenclawString(contents, want) {
+			t.Errorf("citizen surface missing %q in %q", want, contents)
+		}
+	}
+	for _, falseIdentity := range []string{openclawStartedMessage, openclawCompletedMessage, openclawFailedMessage} {
+		if containsOpenclawString(contents, falseIdentity) {
+			t.Errorf("citizen run used main-agent progress %q in %q", falseIdentity, contents)
+		}
+	}
+}
+
+func TestOpenclawProgressDeliveryFailureLogIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	b := &openclawBackend{cfg: Config{Logger: logger}}
+	execPath := filepath.Join(t.TempDir(), "private-executable-sentinel")
+	cwd := filepath.Join(t.TempDir(), "private-cwd-sentinel")
+	b.deliverSafeProgress(context.Background(), execPath, cwd, &openclawProgressDelivery{
+		channel: "discord",
+		target:  "private-target-sentinel",
+		account: "private-account-sentinel",
+	}, openclawStartedMessage)
+
+	output := logs.String()
+	for _, secret := range []string{execPath, cwd, "private-target-sentinel", "private-account-sentinel"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("progress delivery log exposed %q: %s", secret, output)
+		}
+	}
+	for _, diagnostic := range []string{"openclaw progress delivery failed", "channel=discord", "error_bytes"} {
+		if !strings.Contains(output, diagnostic) {
+			t.Errorf("progress delivery log omitted %q: %s", diagnostic, output)
+		}
 	}
 }
 

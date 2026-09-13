@@ -34,7 +34,11 @@ type ExecOptions struct {
 	//
 	// A backend must therefore NOT assume this is populated, and adding a new
 	// backend that only reads SystemPrompt will silently receive nothing.
-	SystemPrompt              string
+	SystemPrompt string
+	// AgentName identifies the Multica citizen executing this turn. OpenClaw
+	// uses it only to choose static main-agent versus citizen progress wording;
+	// it must never be interpolated into persisted progress or logs.
+	AgentName                 string
 	ThreadName                string
 	MaxTurns                  int
 	Timeout                   time.Duration
