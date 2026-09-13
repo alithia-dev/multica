@@ -2947,7 +2947,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 
 	if err != nil {
-		taskLog.Error("task failed", "error", err)
+		taskLog.Error("task failed", "error_bytes", len(err.Error()))
 		// runTask returned without a TaskResult, so we don't have a SessionID
 		// to forward — best we can do is record the failure.
 		// MUL-2946: route the bare error string through the canonical
@@ -3268,7 +3268,7 @@ func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, e
 	reused := task.PriorWorkDir != "" && envWorkDir == task.PriorWorkDir
 	if !reused && task.PriorSessionID != "" {
 		taskLog.Info("dropping prior session: workdir not reused, per-cwd session cannot resolve",
-			"session_id", task.PriorSessionID,
+			"session_id_present", true,
 			"prior_workdir", task.PriorWorkDir,
 			"workdir", envWorkDir,
 		)
@@ -3827,7 +3827,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"reused", reused,
 	)
 	if task.PriorSessionID != "" {
-		taskLog.Info("resuming session", "session_id", task.PriorSessionID)
+		logResumingSession(taskLog)
 	}
 
 	taskStart := time.Now()
@@ -4152,6 +4152,12 @@ func logAgentResultDetail(taskLog *slog.Logger, result agent.Result) {
 		"models_with_usage", len(result.Usage),
 		"agent_error_bytes", len(result.Error),
 	)
+}
+
+// logResumingSession intentionally accepts no session value: provider session
+// identifiers are operational state, not safe daemon-log diagnostics.
+func logResumingSession(taskLog *slog.Logger) {
+	taskLog.Info("resuming session", "session_id_present", true)
 }
 
 // executeAndDrain runs a backend, drains its message stream (forwarding to the

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1203,6 +1204,80 @@ printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-senti
 			if !strings.Contains(check.logOutput, diagnostic) {
 				t.Errorf("log omitted safe diagnostic %q: %s", diagnostic, check.logOutput)
 			}
+		}
+	}
+}
+
+func TestHandleTask_BackendStartErrorNeverEntersDaemonLogs(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"running"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var logs bytes.Buffer
+	d := &Daemon{
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"rt-log-redaction": {ID: "rt-log-redaction", Provider: "openclaw"}},
+		cancelPollInterval: time.Hour,
+	}
+	d.runner = taskRunnerFunc(func(_ context.Context, _ Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
+		return TaskResult{}, errors.New("backend-start-error-sentinel")
+	})
+
+	d.handleTask(context.Background(), Task{
+		ID:        "task-start-log-redaction",
+		RuntimeID: "rt-log-redaction",
+		IssueID:   "issue-log-redaction",
+		Agent:     &AgentData{Name: "test-agent"},
+	}, 0)
+
+	logOutput := logs.String()
+	if strings.Contains(logOutput, "backend-start-error-sentinel") {
+		t.Fatalf("outer task log exposed backend start error: %s", logOutput)
+	}
+	for _, diagnostic := range []string{"task failed", "error_bytes"} {
+		if !strings.Contains(logOutput, diagnostic) {
+			t.Errorf("outer task log omitted %q: %s", diagnostic, logOutput)
+		}
+	}
+}
+
+func TestGateResumeLogsPresenceNotProviderSessionID(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	task := Task{PriorSessionID: "provider-session-sentinel", PriorWorkDir: "/prior/workdir"}
+	taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+
+	if gateResumeToReusedWorkdir(&task, &taskCtx, "/new/workdir", logger) {
+		t.Fatal("different workdir unexpectedly reused prior session")
+	}
+	logOutput := logs.String()
+	if strings.Contains(logOutput, "provider-session-sentinel") {
+		t.Fatalf("resume gate log exposed provider session id: %s", logOutput)
+	}
+	for _, diagnostic := range []string{"dropping prior session", "session_id_present=true"} {
+		if !strings.Contains(logOutput, diagnostic) {
+			t.Errorf("resume gate log omitted %q: %s", diagnostic, logOutput)
+		}
+	}
+
+	logs.Reset()
+	logResumingSession(logger)
+	logOutput = logs.String()
+	if strings.Contains(logOutput, "provider-session-sentinel") {
+		t.Fatalf("normal resume log exposed provider session id: %s", logOutput)
+	}
+	for _, diagnostic := range []string{"resuming session", "session_id_present=true"} {
+		if !strings.Contains(logOutput, diagnostic) {
+			t.Errorf("normal resume log omitted %q: %s", diagnostic, logOutput)
 		}
 	}
 }
