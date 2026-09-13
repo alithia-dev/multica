@@ -5820,7 +5820,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	select {
 	case <-cancelledByPoll:
 		taskLog.Info("task cancelled during execution, discarding result",
-			"branch_name", result.BranchName, "error", err)
+			"branch_name", result.BranchName, "error_present", err != nil)
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
 		// (#5219). The sweeper grace period covers a lost ack's chat settle,
@@ -5845,7 +5845,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 
 	if err != nil {
-		taskLog.Error("task failed", "error", err)
+		taskLog.Error("task failed", "error_bytes", len(err.Error()))
 		// runTask may have reached worktree finalization before returning the
 		// error. Preserve any delivery metadata that defer attached to the named
 		// result, especially the actual/preserved workdir and delivered branch.
@@ -6498,7 +6498,7 @@ func gateResumeToReachableSession(task *Task, taskCtx *execenv.TaskContextForEnv
 	if !reachable && task.PriorSessionID != "" {
 		taskLog.Info("dropping prior session: session store not reachable from this run",
 			"provider", provider,
-			"session_id", task.PriorSessionID,
+			"session_id_present", true,
 			"prior_workdir", task.PriorWorkDir,
 			"workdir", envWorkDir,
 			"session_home_reachable", sessionHomeReachable,
@@ -6795,7 +6795,7 @@ func gateCodexResumeToRolloutPresence(task *Task, taskCtx *execenv.TaskContextFo
 		return
 	}
 	taskLog.Warn("dropping prior codex session: rollout not present in task CODEX_HOME; starting a fresh thread",
-		"session_id", task.PriorSessionID, "codex_home", codexHome)
+		"session_id_present", true, "codex_home", codexHome)
 	task.PriorSessionID = ""
 	taskCtx.PriorSessionResumed = false
 	// The user expected this run to continue the prior conversation; surface the
@@ -8516,7 +8516,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"resume_reachable", resumeReachable,
 	)
 	if task.PriorSessionID != "" {
-		taskLog.Info("resuming session", "session_id", task.PriorSessionID)
+		logResumingSession(taskLog)
 	}
 
 	taskStart := time.Now()
@@ -8770,7 +8770,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var sessionRolloutMissing bool
 	if result.SessionID != "" && !codexSessionResumable(env.CodexHome, result.SessionID, codexRolloutFlushWait) {
 		taskLog.Warn("codex session rollout not present in task CODEX_HOME; withholding resume pointer and flagging continuity gap",
-			"session_id", result.SessionID, "codex_home", env.CodexHome, "status", result.Status)
+			"session_id_present", true, "codex_home", env.CodexHome, "status", result.Status)
 		result.SessionID = ""
 		sessionRolloutMissing = true
 	}
@@ -8978,6 +8978,12 @@ func logAgentResultDetail(taskLog *slog.Logger, result agent.Result) {
 		"models_with_usage", len(result.Usage),
 		"agent_error_bytes", len(result.Error),
 	)
+}
+
+// logResumingSession intentionally accepts no session value: provider session
+// identifiers are operational state, not safe daemon-log diagnostics.
+func logResumingSession(taskLog *slog.Logger) {
+	taskLog.Info("resuming session", "session_id_present", true)
 }
 
 // shouldRetryWithFreshSession reports whether a failed run that requested
@@ -9393,7 +9399,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						go func() {
 							if !waitCodexRolloutPresent(drainCtx, codexHome, sid) {
 								taskLog.Debug("skip pinning codex session: rollout not present before run ended",
-									"session_id", sid, "codex_home", codexHome)
+									"session_id_present", true, "codex_home", codexHome)
 								return
 							}
 							pinCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -9999,17 +10005,6 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:8]
-}
-
-// truncateLog truncates a string to maxLen, appending "…" if truncated.
-// Also collapses newlines to spaces for single-line log output.
-func truncateLog(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.TrimSpace(s)
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "…"
 }
 
 func convertSkillsForEnv(skills []SkillData) []execenv.SkillContextForEnv {
