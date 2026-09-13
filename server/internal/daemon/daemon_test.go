@@ -2634,6 +2634,87 @@ func (b *transcriptBackend) Execute(_ context.Context, _ string, _ agent.ExecOpt
 	return &agent.Session{Messages: msgCh, Result: resCh}, nil
 }
 
+func TestExecuteAndDrain_OpenclawContentNeverEntersDaemonLogs(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+printf '%s\n' '{"type":"text","sessionId":"session-sentinel","text":"prompt-sentinel route-sentinel account-sentinel transaction-sentinel"}'
+printf '%s\n' '{"type":"error","text":"credential-sentinel token-sentinel balance-sentinel"}'
+printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-sentinel"}'
+`
+	if err := os.WriteFile(fakePath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake openclaw: %v", err)
+	}
+
+	var backendLogs bytes.Buffer
+	backendLog := slog.New(slog.NewTextHandler(&backendLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	var taskLogs bytes.Buffer
+	taskLog := slog.New(slog.NewTextHandler(&taskLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	backend, err := agent.New("openclaw", agent.Config{ExecutablePath: fakePath, Logger: backendLog})
+	if err != nil {
+		t.Fatalf("new OpenClaw backend: %v", err)
+	}
+	d, rec := newTranscriptRecorder(t)
+	result, _, err := d.executeAndDrain(context.Background(), backend, "task", agent.ExecOptions{}, taskLog, "task-log-redaction", new(atomic.Int32))
+	if err != nil {
+		t.Fatalf("executeAndDrain: %v", err)
+	}
+	if result.Status != "failed" || result.Error != "environment-sentinel" {
+		t.Fatalf("user-facing result changed: %+v", result)
+	}
+	logAgentResultDetail(taskLog, result)
+
+	transcript := rec.snapshot()
+	if len(transcript) == 0 {
+		t.Fatal("expected user-facing transcript content to be preserved")
+	}
+	var transcriptContent strings.Builder
+	for _, message := range transcript {
+		transcriptContent.WriteString(message.Content)
+	}
+	for _, preserved := range []string{"prompt-sentinel", "credential-sentinel", "environment-sentinel"} {
+		if !strings.Contains(transcriptContent.String(), preserved) {
+			t.Errorf("user-facing transcript dropped %q: %+v", preserved, transcript)
+		}
+	}
+	for name, logOutput := range map[string]string{
+		"backend": backendLogs.String(),
+		"task":    taskLogs.String(),
+	} {
+		for _, sentinel := range []string{
+			"prompt-sentinel", "route-sentinel", "account-sentinel",
+			"credential-sentinel", "token-sentinel", "balance-sentinel",
+			"transaction-sentinel", "environment-sentinel", "session-sentinel",
+		} {
+			if strings.Contains(logOutput, sentinel) {
+				t.Errorf("%s log exposed %q: %s", name, sentinel, logOutput)
+			}
+		}
+	}
+	checks := []struct {
+		logOutput   string
+		diagnostics []string
+	}{
+		{backendLogs.String(), []string{"openclaw error event", "openclaw lifecycle failure"}},
+		{taskLogs.String(), []string{"agent text observed", "content_bytes", "agent error observed", "agent result detail", "agent_error_bytes", "session_id_present"}},
+	}
+	for _, check := range checks {
+		for _, diagnostic := range check.diagnostics {
+			if !strings.Contains(check.logOutput, diagnostic) {
+				t.Errorf("log omitted safe diagnostic %q: %s", diagnostic, check.logOutput)
+			}
+		}
+	}
+}
+
 // transcriptRecorder collects the task messages a daemon reports to its
 // message endpoint.
 type transcriptRecorder struct {

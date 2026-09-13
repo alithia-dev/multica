@@ -8678,7 +8678,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if !result.ResumeRejectedTransient {
 			retiredSessionID = task.PriorSessionID
 		}
-		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
+		taskLog.Warn("session resume failed, retrying with fresh session", "error_bytes", len(result.Error))
 
 		// Rebuild cold-session context before the single retry. The prior
 		// provider transcript is gone (missing, account-mismatched, or —
@@ -8715,11 +8715,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 
 		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
 		if retryErr != nil {
-			taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "error", retryErr)
+			taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "error_bytes", len(retryErr.Error()))
 		} else if retryResult.Status != "completed" && retryResult.SessionID == "" {
 			taskLog.Warn("fresh session retry also failed without establishing a new session; keeping the original poisoned result",
 				"retry_status", retryResult.Status,
-				"retry_error", retryResult.Error,
+				"retry_error_bytes", len(retryResult.Error),
 			)
 		}
 		// The poisoned prior session id lives ONLY on firstResult (classified
@@ -8738,13 +8738,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"duration", elapsed.String(),
 		"tools", tools,
 	)
-	taskLog.Debug("agent result detail",
-		"status", result.Status,
-		"output_bytes", len(result.Output),
-		"session_id", result.SessionID,
-		"models_with_usage", len(result.Usage),
-		"agent_error", result.Error,
-	)
+	logAgentResultDetail(taskLog, result)
 
 	// Convert agent usage map to task usage entries.
 	var usageEntries []TaskUsageEntry
@@ -8973,6 +8967,19 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 }
 
+// logAgentResultDetail records only typed metadata. Result output and errors
+// are subprocess-controlled and may contain prompts, financial rows, route
+// identifiers, credentials, tokens, or environment-derived values.
+func logAgentResultDetail(taskLog *slog.Logger, result agent.Result) {
+	taskLog.Debug("agent result detail",
+		"status", result.Status,
+		"output_bytes", len(result.Output),
+		"session_id_present", result.SessionID != "",
+		"models_with_usage", len(result.Usage),
+		"agent_error_bytes", len(result.Error),
+	)
+}
+
 // shouldRetryWithFreshSession reports whether a failed run that requested
 // --resume should be retried once from a fresh session.
 //
@@ -9185,7 +9192,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		// covers claude, opencode and any CLI added later without a wrap in
 		// each backend (MUL-6164).
 		err = agent.ExplainExecError(err)
-		taskLog.Debug("backend execute returned error", "error", err)
+		taskLog.Debug("backend execute returned error", "error_bytes", len(err.Error()))
 		return agent.Result{}, 0, err
 	}
 	// This counter intentionally starts at the narrower provider-session
@@ -9473,7 +9480,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					}
 				case agent.MessageText:
 					if msg.Content != "" {
-						taskLog.Debug("agent", "text", truncateLog(msg.Content, 200))
+						taskLog.Debug("agent text observed", "content_bytes", len(msg.Content))
 						mu.Lock()
 						pendingText.WriteString(msg.Content)
 						if pendingTextAt.IsZero() {
@@ -9482,7 +9489,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						mu.Unlock()
 					}
 				case agent.MessageError:
-					taskLog.Error("agent error", "content", msg.Content)
+					taskLog.Error("agent error observed", "content_bytes", len(msg.Content))
 					s := msgSeq.Add(1)
 					mu.Lock()
 					batch = append(batch, TaskMessageData{
