@@ -4321,7 +4321,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 				case agent.MessageToolUse:
 					n := toolCount.Add(1)
 					inFlightTools.Add(1)
-					taskLog.Info(fmt.Sprintf("tool #%d: %s", n, msg.Tool))
+					taskLog.Info("tool use observed",
+						"count", n,
+						"tool_name_bytes", len(msg.Tool),
+						"call_id_present", msg.CallID != "",
+					)
 					if msg.CallID != "" {
 						mu.Lock()
 						callIDToTool[msg.CallID] = msg.Tool
@@ -4362,7 +4366,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						toolName = callIDToTool[msg.CallID]
 						mu.Unlock()
 					}
-					taskLog.Info("tool_result observed", "seq", s, "tool", toolName, "call_id", msg.CallID)
+					taskLog.Info("tool result observed",
+						"seq", s,
+						"tool_name_bytes", len(toolName),
+						"call_id_present", msg.CallID != "",
+					)
 					mu.Lock()
 					batch = append(batch, TaskMessageData{
 						Seq:    int(s),
