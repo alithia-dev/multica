@@ -96,7 +96,7 @@ func (b *syncBuffer) String() string {
 // TestOpenclawExecuteCompletesWhenCLINeverExits is the assertion that would have
 // caught the undelivered-reply incident.
 func TestOpenclawExecuteCompletesWhenCLINeverExits(t *testing.T) {
-	bin := writeOpenclawStub(t, completeOpenclawResult, true)
+	bin := writeOpenclawStub(t, `{"type":"lifecycle","phase":"source_opened"}`+"\n"+completeOpenclawResult, true)
 	b := newOpenclawTestBackend(bin)
 
 	// No per-run timeout in ExecOptions, matching production since MUL-3064
@@ -110,8 +110,9 @@ func TestOpenclawExecuteCompletesWhenCLINeverExits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	for range session.Messages {
-		// drain
+	var messages strings.Builder
+	for message := range session.Messages {
+		messages.WriteString(message.Content)
 	}
 	result, ok := <-session.Result
 	elapsed := time.Since(start)
@@ -129,6 +130,9 @@ func TestOpenclawExecuteCompletesWhenCLINeverExits(t *testing.T) {
 	}
 	if result.SessionID != "sess-abc" {
 		t.Errorf("session id = %q, want sess-abc", result.SessionID)
+	}
+	if !strings.Contains(messages.String(), openclawSourceOpenedMessage) {
+		t.Errorf("messages = %q, missing lifecycle progress before the lingering process was stopped", messages.String())
 	}
 	// Bound only has to be far below the 60s ctx and the stub's 300s sleep: if
 	// the boundary mechanism failed, this takes one of those, not 20s.

@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -238,17 +237,11 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		defer close(resCh)
 
 		startTime := time.Now()
-		stdoutBytes, readErr := readOpenclawOutput(runCtx, stdout, phaseCh)
+		scanResult := b.processOutputWithProgress(stdout, msgCh, phaseCh)
 		close(phaseCh)
 		<-progressDone
 		if runCtx.Err() == nil {
 			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, openclawFinalizingMessage)
-		}
-		var scanResult openclawEventResult
-		if readErr != nil {
-			scanResult = openclawEventResult{status: "failed", errMsg: fmt.Sprintf("read stdout: %v", readErr)}
-		} else {
-			scanResult = b.processOutput(bytes.NewReader(stdoutBytes), msgCh)
 		}
 
 		// openclaw delivered a complete result but would not exit. Cancel the
@@ -307,12 +300,19 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		}
 
 		b.cfg.Logger.Info("openclaw finished", "pid", cmd.Process.Pid, "status", scanResult.status, "duration", duration.Round(time.Millisecond).String())
-		if runCtx.Err() == nil {
+		completionCtx := runCtx
+		if scanResult.cutShort {
+			// The adapter cancelled runCtx only to stop a process that had already
+			// delivered its terminal result. Preserve final progress on the still-live
+			// caller context; an actual caller cancellation still suppresses it.
+			completionCtx = ctx
+		}
+		if completionCtx.Err() == nil {
 			completion := progressMessages.completed
 			if scanResult.status != "completed" {
 				completion = progressMessages.failed
 			}
-			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, completion)
+			b.publishSafeProgress(completionCtx, msgCh, execPath, opts.Cwd, progressDelivery, completion)
 		}
 
 		// Build usage map. Prefer the model openclaw reported in
@@ -386,35 +386,54 @@ func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Mess
 	}
 }
 
-// readOpenclawOutput preserves stdout byte-for-byte for the existing result
-// parser while recognizing only explicit, line-delimited lifecycle events.
-// Tool names, arguments, output, and free-form text never become progress.
-func readOpenclawOutput(ctx context.Context, r io.Reader, phases chan<- string) ([]byte, error) {
-	reader := bufio.NewReader(r)
-	var output bytes.Buffer
-	seen := make(map[string]struct{})
+// openclawLifecycleProgressObserver recognizes only complete, explicit lifecycle
+// event lines while the existing final-result reader retains ownership of the
+// byte stream and its idle-grace completion boundary.
+type openclawLifecycleProgressObserver struct {
+	pending []byte
+	seen    map[string]struct{}
+	phases  chan<- string
+}
+
+func newOpenclawLifecycleProgressObserver(phases chan<- string) *openclawLifecycleProgressObserver {
+	return &openclawLifecycleProgressObserver{seen: make(map[string]struct{}), phases: phases}
+}
+
+func (o *openclawLifecycleProgressObserver) observe(chunk []byte) {
+	o.pending = append(o.pending, chunk...)
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			_, _ = output.Write(line)
-			if event, ok := tryParseOpenclawEvent(strings.TrimSpace(string(line))); ok {
-				if content := openclawLifecycleProgress(event); content != "" {
-					if _, duplicate := seen[content]; !duplicate {
-						seen[content] = struct{}{}
-						select {
-						case phases <- content:
-						case <-ctx.Done():
-						}
-					}
-				}
-			}
+		newline := bytes.IndexByte(o.pending, '\n')
+		if newline < 0 {
+			return
 		}
-		if err != nil {
-			if err == io.EOF {
-				return output.Bytes(), nil
-			}
-			return output.Bytes(), err
-		}
+		o.observeLine(o.pending[:newline])
+		o.pending = o.pending[newline+1:]
+	}
+}
+
+func (o *openclawLifecycleProgressObserver) flush() {
+	if len(o.pending) > 0 {
+		o.observeLine(o.pending)
+		o.pending = nil
+	}
+}
+
+func (o *openclawLifecycleProgressObserver) observeLine(line []byte) {
+	event, ok := tryParseOpenclawEvent(strings.TrimSpace(string(line)))
+	if !ok {
+		return
+	}
+	content := openclawLifecycleProgress(event)
+	if content == "" {
+		return
+	}
+	if _, duplicate := o.seen[content]; duplicate {
+		return
+	}
+	o.seen[content] = struct{}{}
+	select {
+	case o.phases <- content:
+	default:
 	}
 }
 
@@ -715,7 +734,20 @@ type openclawEventResult struct {
 // the dominant happy path (one pretty-printed JSON blob) deterministic
 // while keeping NDJSON event support intact.
 func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclawEventResult {
-	buf, cutShort, readErr := readOpenclawStdout(r, openclawResultIdleGrace)
+	return b.processOutputWithProgress(r, ch, nil)
+}
+
+func (b *openclawBackend) processOutputWithProgress(r io.Reader, ch chan<- Message, phases chan<- string) openclawEventResult {
+	var observer *openclawLifecycleProgressObserver
+	var observe func([]byte)
+	if phases != nil {
+		observer = newOpenclawLifecycleProgressObserver(phases)
+		observe = observer.observe
+	}
+	buf, cutShort, readErr := readOpenclawStdoutObserved(r, openclawResultIdleGrace, observe)
+	if observer != nil {
+		observer.flush()
+	}
 	if readErr != nil {
 		return openclawEventResult{status: "failed", errMsg: fmt.Sprintf("read stdout: %v", readErr)}
 	}
@@ -731,14 +763,9 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 		return res
 	}
 
-	// Fall-back path: NDJSON line scanner. Note that because we already
-	// drained the full buffer with io.ReadAll above, this path is no longer
-	// truly streaming — events accumulate until the subprocess closes
-	// stdout, then drain all at once. OpenClaw 2026.5.x does not emit
-	// streaming events, so this regression is invisible today; if a future
-	// backend on this code path emits real NDJSON streams and needs live
-	// progress updates, we'll need to split the fast path off a streaming
-	// reader instead of io.ReadAll.
+	// Fall-back path: NDJSON line scanner. Result and transcript processing
+	// remains buffered so the existing parser sees the exact byte stream, while
+	// the observer above reports only allowlisted lifecycle transitions live.
 	scanner := newAgentStreamScanner(bytes.NewReader(buf))
 
 	var output strings.Builder
@@ -865,6 +892,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 		sessionID: sessionID,
 		usage:     usage,
 		model:     model,
+		cutShort:  cutShort,
 	}
 }
 
@@ -895,6 +923,31 @@ func parseWholeBufferOpenclawResult(buf []byte) (openclawResult, bool) {
 				return result, true
 			}
 			return openclawResult{}, false
+		}
+	}
+	return openclawResult{}, false
+}
+
+// parseBufferedOpenclawTerminalResult determines whether a silent stdout
+// buffer already ends in a complete terminal result. The normal OpenClaw
+// format is one result blob, but lifecycle-aware versions can prefix that blob
+// with line-delimited events. This helper is intentionally used only by the
+// idle-grace reader: processOutput still parses the mixed stream as NDJSON so
+// preceding events retain their normal semantics.
+func parseBufferedOpenclawTerminalResult(buf []byte) (openclawResult, bool) {
+	if result, ok := parseWholeBufferOpenclawResult(buf); ok {
+		return result, true
+	}
+
+	trimmed := strings.TrimSpace(string(buf))
+	lines := strings.Split(trimmed, "\n")
+	for i := 1; i < len(lines); i++ {
+		if len(lines[i]) == 0 || lines[i][0] != '{' {
+			continue
+		}
+		candidate := strings.TrimSpace(strings.Join(lines[i:], "\n"))
+		if result, ok := tryParseOpenclawResult(candidate); ok {
+			return result, true
 		}
 	}
 	return openclawResult{}, false

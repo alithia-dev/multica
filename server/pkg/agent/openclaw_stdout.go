@@ -61,6 +61,14 @@ const openclawStdoutPoll = 100 * time.Millisecond
 // Execute already arranges. Callers that do not close r on cancellation must
 // not use this function.
 func readOpenclawStdout(r io.Reader, idleGrace time.Duration) (buf []byte, cutShort bool, err error) {
+	return readOpenclawStdoutObserved(r, idleGrace, nil)
+}
+
+// readOpenclawStdoutObserved preserves the idle-grace protocol boundary while
+// exposing each byte chunk to a non-blocking observer. The observer is disabled
+// under the reader mutex before an early return, so it is safe for the caller to
+// close downstream progress channels while the pipe read is still unwinding.
+func readOpenclawStdoutObserved(r io.Reader, idleGrace time.Duration, observe func([]byte)) (buf []byte, cutShort bool, err error) {
 	if idleGrace <= 0 {
 		idleGrace = openclawResultIdleGrace
 	}
@@ -99,6 +107,9 @@ func readOpenclawStdout(r io.Reader, idleGrace time.Duration) (buf []byte, cutSh
 				if n > 0 {
 					acc = append(acc, chunk[:n]...)
 					lastByte = time.Now()
+					if observe != nil {
+						observe(chunk[:n])
+					}
 				}
 				if rerr != nil {
 					if rerr != io.EOF {
@@ -149,9 +160,12 @@ func readOpenclawStdout(r io.Reader, idleGrace time.Duration) (buf []byte, cutSh
 			if out == nil {
 				continue
 			}
-			if _, ok := parseWholeBufferOpenclawResult(out); !ok {
+			if _, ok := parseBufferedOpenclawTerminalResult(out); !ok {
 				continue
 			}
+			mu.Lock()
+			observe = nil
+			mu.Unlock()
 			return out, true, nil
 		}
 	}
