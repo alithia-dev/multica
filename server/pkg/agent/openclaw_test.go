@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -1081,6 +1082,69 @@ func TestBuildOpenclawArgsFiltersBlockedCustomArgs(t *testing.T) {
 	}
 	if count := countOccurrences(args, "--message"); count != 1 {
 		t.Errorf("expected 1 --message (daemon-managed), got %d: %v", count, args)
+	}
+}
+
+func TestOpenclawCommandLogRedactsPromptRoutesCredentialsAndSubprocessOutput(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+echo 'transaction=row-secret balance=balance-secret token=stderr-token env='$PRIVATE_ENV >&2
+printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":1}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	b := &openclawBackend{cfg: Config{
+		ExecutablePath: fakePath,
+		Env:            map[string]string{"PRIVATE_ENV": "environment-secret"},
+		Logger:         logger,
+	}}
+	session, err := b.Execute(context.Background(), "prompt-secret", ExecOptions{
+		SystemPrompt: "system-prompt-secret",
+		CustomArgs: []string{
+			"--channel", "discord",
+			"--reply-to", "channel:private-target",
+			"--reply-account", "private-account",
+			"--api-key", "credential-secret",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for range session.Messages {
+	}
+	if result := <-session.Result; result.Status != "completed" {
+		t.Fatalf("result = %+v, want completed", result)
+	}
+
+	output := logs.String()
+	for _, secret := range []string{
+		"prompt-secret", "system-prompt-secret", "channel:private-target",
+		"private-account", "credential-secret", "row-secret", "balance-secret",
+		"stderr-token", "environment-secret",
+	} {
+		if strings.Contains(output, secret) {
+			t.Errorf("OpenClaw log exposed %q: %s", secret, output)
+		}
+	}
+	for _, diagnostic := range []string{
+		"agent command", "provider=openclaw", "agent", "--message", "--reply-to",
+		"--reply-account", "--api-key", redactedAgentCommandArg, "arg_count",
+		"[openclaw:stderr] output suppressed", "openclaw finished",
+	} {
+		if !strings.Contains(output, diagnostic) {
+			t.Errorf("OpenClaw log omitted safe diagnostic %q: %s", diagnostic, output)
+		}
 	}
 }
 

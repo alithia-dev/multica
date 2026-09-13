@@ -100,7 +100,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	logAgentCommand(b.cfg.Logger, "openclaw", cmd, newAgentCommandLogArgs(args, map[int]string{0: "agent"}))
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -116,7 +116,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		cancel()
 		return nil, fmt.Errorf("openclaw stdout pipe: %w", err)
 	}
-	cmd.Stderr = newLogWriter(b.cfg.Logger, "[openclaw:stderr] ")
+	cmd.Stderr = newRedactedSubprocessLogWriter(b.cfg.Logger, "[openclaw:stderr] ")
 
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -612,7 +612,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				})
 			case "error":
 				errMsg := event.errorMessage()
-				b.cfg.Logger.Warn("openclaw error event", "error", errMsg)
+				b.cfg.Logger.Warn("openclaw error event", "detail", redactedAgentCommandArg)
 				trySend(ch, Message{Type: MessageError, Content: errMsg})
 				finalStatus = "failed"
 				finalError = errMsg
@@ -620,7 +620,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				phase := event.Phase
 				if phase == "error" || phase == "failed" || phase == "cancelled" {
 					errMsg := event.errorMessage()
-					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "error", errMsg)
+					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "detail", redactedAgentCommandArg)
 					trySend(ch, Message{Type: MessageError, Content: errMsg})
 					finalStatus = "failed"
 					finalError = errMsg
@@ -658,7 +658,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 		}
 
 		// Not JSON — treat as log line.
-		b.cfg.Logger.Debug("[openclaw:stdout] " + line)
+		b.cfg.Logger.Debug("[openclaw:stdout] unstructured output suppressed")
 		rawLines = append(rawLines, line)
 	}
 
