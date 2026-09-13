@@ -29,6 +29,29 @@ const openclawNoParseableOutput = "openclaw returned no parseable output"
 // of "openclaw returned no parseable output".
 const minOpenclawVersion = "2026.5.5"
 
+// openclawProgressCadence controls how often the adapter emits a safe,
+// synthetic phase checkpoint while waiting for OpenClaw's final JSON result.
+// OpenClaw currently exposes no live event stream for gateway-backed runs, so
+// these checkpoints describe the adapter's coarse execution window rather
+// than claiming that a particular tool call or data mutation occurred.
+const openclawProgressCadence = 30 * time.Second
+
+// openclawProgressMessages are intentionally static. Never interpolate the
+// prompt, paths, tool data, subprocess output, or environment values here:
+// task messages are persisted and broadcast to operators while the run is
+// active. The write-phase wording is conditional because read-only tasks must
+// not appear to have changed data.
+var openclawProgressMessages = []string{
+	"OpenClaw run started",
+	"OpenClaw run active — source/package inspection",
+	"OpenClaw run active — preflight checks",
+	"OpenClaw run active — write/apply phase when authorized",
+	"OpenClaw run active — readback/replay verification",
+}
+
+const openclawFinalizingMessage = "OpenClaw run finalizing"
+const openclawStillActiveMessage = "OpenClaw run active — awaiting completion"
+
 // openclawVersionPattern extracts a three-segment dotted version from
 // arbitrary `openclaw --version` output (e.g. "openclaw 2026.5.5",
 // "openclaw v2026.5.5 c37871e").
@@ -50,6 +73,9 @@ var openclawBlockedArgs = map[string]blockedArgMode{
 // stdout — similar to the opencode backend.
 type openclawBackend struct {
 	cfg Config
+	// progressCadence is a test seam. Zero selects
+	// openclawProgressCadence; production construction never sets it.
+	progressCadence time.Duration
 }
 
 func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
@@ -119,6 +145,10 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	trySend(msgCh, Message{Type: MessageText, Content: openclawProgressMessages[0]})
+	progressCtx, stopProgress := context.WithCancel(runCtx)
+	progressDone := make(chan struct{})
+	go b.streamSafeProgress(progressCtx, msgCh, progressDone)
 
 	// Close stdout when the context is cancelled so the scanner unblocks.
 	go func() {
@@ -132,7 +162,18 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		defer close(resCh)
 
 		startTime := time.Now()
-		scanResult := b.processOutput(stdout, msgCh)
+		stdoutBytes, readErr := io.ReadAll(stdout)
+		stopProgress()
+		<-progressDone
+		if runCtx.Err() == nil {
+			trySend(msgCh, Message{Type: MessageText, Content: openclawFinalizingMessage})
+		}
+		var scanResult openclawEventResult
+		if readErr != nil {
+			scanResult = openclawEventResult{status: "failed", errMsg: fmt.Sprintf("read stdout: %v", readErr)}
+		} else {
+			scanResult = b.processOutput(bytes.NewReader(stdoutBytes), msgCh)
+		}
 
 		// openclaw delivered a complete result but would not exit. Cancel the
 		// run context so CommandContext kills it and cmd.Wait can return —
@@ -221,6 +262,46 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+// streamSafeProgress keeps final-result-only OpenClaw runs observable without
+// exposing any subprocess data. Once the named phase checkpoints are exhausted
+// it emits a periodic liveness checkpoint so long financial runs do not look
+// hung. Cancellation stops the stream promptly and emits no further messages.
+func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}) {
+	defer close(done)
+
+	cadence := b.progressCadence
+	if cadence <= 0 {
+		cadence = openclawProgressCadence
+	}
+
+	phase := 1
+	emit := func(content string) bool {
+		select {
+		case ch <- Message{Type: MessageText, Content: content}:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	ticker := time.NewTicker(cadence)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			content := openclawStillActiveMessage
+			if phase < len(openclawProgressMessages) {
+				content = openclawProgressMessages[phase]
+				phase++
+			}
+			if !emit(content) {
+				return
+			}
+		}
+	}
 }
 
 // buildOpenclawArgs assembles the argv for a one-shot `openclaw agent` invocation.
