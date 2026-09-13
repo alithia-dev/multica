@@ -2648,6 +2648,8 @@ if [ "$1" = "--version" ]; then
   exit 0
 fi
 printf '%s\n' '{"type":"text","sessionId":"session-sentinel","text":"prompt-sentinel route-sentinel account-sentinel transaction-sentinel"}'
+printf '%s\n' '{"type":"tool_use","tool":"tool-name-sentinel","callId":"call-id-sentinel","input":{"value":"tool-input-sentinel"}}'
+printf '%s\n' '{"type":"tool_result","callId":"call-id-sentinel","text":"tool-output-sentinel"}'
 printf '%s\n' '{"type":"error","text":"credential-sentinel token-sentinel balance-sentinel"}'
 printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-sentinel"}'
 `
@@ -2686,6 +2688,18 @@ printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-senti
 			t.Errorf("user-facing transcript dropped %q: %+v", preserved, transcript)
 		}
 	}
+	var toolUsePreserved, toolResultPreserved bool
+	for _, message := range transcript {
+		if message.Type == "tool_use" && message.Tool == "tool-name-sentinel" && message.Input["value"] == "tool-input-sentinel" {
+			toolUsePreserved = true
+		}
+		if message.Type == "tool_result" && message.Tool == "tool-name-sentinel" && message.Output == "tool-output-sentinel" {
+			toolResultPreserved = true
+		}
+	}
+	if !toolUsePreserved || !toolResultPreserved {
+		t.Errorf("tool transcript behavior changed: %+v", transcript)
+	}
 	for name, logOutput := range map[string]string{
 		"backend": backendLogs.String(),
 		"task":    taskLogs.String(),
@@ -2694,6 +2708,7 @@ printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-senti
 			"prompt-sentinel", "route-sentinel", "account-sentinel",
 			"credential-sentinel", "token-sentinel", "balance-sentinel",
 			"transaction-sentinel", "environment-sentinel", "session-sentinel",
+			"tool-name-sentinel", "call-id-sentinel", "tool-input-sentinel", "tool-output-sentinel",
 		} {
 			if strings.Contains(logOutput, sentinel) {
 				t.Errorf("%s log exposed %q: %s", name, sentinel, logOutput)
@@ -2705,7 +2720,7 @@ printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-senti
 		diagnostics []string
 	}{
 		{backendLogs.String(), []string{"openclaw error event", "openclaw lifecycle failure"}},
-		{taskLogs.String(), []string{"agent text observed", "content_bytes", "agent error observed", "agent result detail", "agent_error_bytes", "session_id_present"}},
+		{taskLogs.String(), []string{"agent text observed", "content_bytes", "tool use observed", "tool result observed", "tool_name_bytes", "call_id_present", "agent error observed", "agent result detail", "agent_error_bytes", "session_id_present"}},
 	}
 	for _, check := range checks {
 		for _, diagnostic := range check.diagnostics {
