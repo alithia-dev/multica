@@ -95,22 +95,21 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("multica-%d", time.Now().UnixNano())
 	}
-	args := buildOpenclawArgs(prompt, sessionID, opts, b.cfg.Logger)
+	args, commandLogArgs := buildOpenclawArgsForCommandLog(prompt, sessionID, opts, b.cfg.Logger)
 	progressDelivery := parseOpenclawProgressDelivery(args)
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
-	logAgentCommand(b.cfg.Logger, "openclaw", cmd, newAgentCommandLogArgs(args, map[int]string{0: "agent"}))
+	logAgentCommand(b.cfg.Logger, "openclaw", cmd, commandLogArgs)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
 	cmd.Env = buildEnv(b.cfg.Env)
 
-	// openclaw writes its --json output to stdout. Stderr carries log
-	// overflow (security warnings, tool errors, etc.) — capture it via a
-	// log writer so it surfaces in daemon logs without being fed into the
-	// JSON parser.
+	// openclaw writes its --json output to stdout. Stderr can carry prompts,
+	// tool output, or secrets, so preserve only the fact that output occurred;
+	// never feed subprocess-controlled content into daemon logs or the parser.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -407,13 +406,31 @@ func (b *openclawBackend) deliverSafeProgress(ctx context.Context, execPath, cwd
 // --local stays in openclawBlockedArgs so users cannot smuggle it back in via
 // custom_args under gateway mode (mode is the single source of truth).
 func buildOpenclawArgs(prompt, sessionID string, opts ExecOptions, logger *slog.Logger) []string {
+	args, _ := buildOpenclawArgsForCommandLog(prompt, sessionID, opts, logger)
+	return args
+}
+
+// buildOpenclawArgsForCommandLog assembles argv together with the exact
+// adapter-owned positions that may remain visible in command diagnostics.
+// Custom arguments and every value position are deliberately untrusted, even
+// when their content happens to look like valid short or long flag syntax.
+func buildOpenclawArgsForCommandLog(prompt, sessionID string, opts ExecOptions, logger *slog.Logger) ([]string, agentCommandLogArgs) {
 	args := []string{"agent"}
-	if opts.OpenclawMode != "gateway" {
-		args = append(args, "--local")
+	trustedPositionals := map[int]string{0: "agent"}
+	trustedFlags := make(map[int]string)
+	appendTrustedFlag := func(flag string) {
+		trustedFlags[len(args)] = flag
+		args = append(args, flag)
 	}
-	args = append(args, "--json", "--session-id", sessionID)
+	if opts.OpenclawMode != "gateway" {
+		appendTrustedFlag("--local")
+	}
+	appendTrustedFlag("--json")
+	appendTrustedFlag("--session-id")
+	args = append(args, sessionID)
 	if opts.Timeout > 0 {
-		args = append(args, "--timeout", fmt.Sprintf("%d", int(opts.Timeout.Seconds())))
+		appendTrustedFlag("--timeout")
+		args = append(args, fmt.Sprintf("%d", int(opts.Timeout.Seconds())))
 	}
 	// OpenClaw binds models to pre-registered agents at `openclaw agents
 	// add/update --model` time; the daemon selects one at runtime by
@@ -425,15 +442,17 @@ func buildOpenclawArgs(prompt, sessionID string, opts ExecOptions, logger *slog.
 	// backward compatibility with existing configs.
 	customArgs := filterCustomArgs(opts.CustomArgs, openclawBlockedArgs, logger)
 	if opts.Model != "" && !customArgsContains(customArgs, "--agent") {
-		args = append(args, "--agent", opts.Model)
+		appendTrustedFlag("--agent")
+		args = append(args, opts.Model)
 	}
 	args = append(args, customArgs...)
 
 	if opts.SystemPrompt != "" {
 		prompt = opts.SystemPrompt + "\n\n" + prompt
 	}
-	args = append(args, "--message", prompt)
-	return args
+	appendTrustedFlag("--message")
+	args = append(args, prompt)
+	return args, newAgentCommandLogArgs(args, trustedPositionals, trustedFlags)
 }
 
 // customArgsContains reports whether args contains the given flag

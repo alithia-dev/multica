@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -1109,13 +1110,12 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":1}}'
 		Env:            map[string]string{"PRIVATE_ENV": "environment-secret"},
 		Logger:         logger,
 	}}
-	session, err := b.Execute(context.Background(), "prompt-secret", ExecOptions{
-		SystemPrompt: "system-prompt-secret",
+	session, err := b.Execute(context.Background(), "--private-balance", ExecOptions{
 		CustomArgs: []string{
-			"--channel", "discord",
-			"--reply-to", "channel:private-target",
-			"--reply-account", "private-account",
-			"--api-key", "credential-secret",
+			"--channel", "--private-channel",
+			"--reply-to", "--private-target",
+			"--reply-account", "-a",
+			"--api-key", "--private-token",
 		},
 	})
 	if err != nil {
@@ -1126,20 +1126,24 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":1}}'
 	if result := <-session.Result; result.Status != "completed" {
 		t.Fatalf("result = %+v, want completed", result)
 	}
+	systemArgs, systemLogArgs := buildOpenclawArgsForCommandLog("task", "system-session", ExecOptions{
+		SystemPrompt: "--private-system-prompt",
+	}, logger)
+	logAgentCommand(logger, "openclaw", exec.Command(fakePath, systemArgs...), systemLogArgs)
 
 	output := logs.String()
 	for _, secret := range []string{
-		"prompt-secret", "system-prompt-secret", "channel:private-target",
-		"private-account", "credential-secret", "row-secret", "balance-secret",
-		"stderr-token", "environment-secret",
+		"--private-balance", "--private-system-prompt", "--private-channel",
+		"--private-target", "-a", "--private-token", "row-secret",
+		"balance-secret", "stderr-token", "environment-secret",
 	} {
 		if strings.Contains(output, secret) {
 			t.Errorf("OpenClaw log exposed %q: %s", secret, output)
 		}
 	}
 	for _, diagnostic := range []string{
-		"agent command", "provider=openclaw", "agent", "--message", "--reply-to",
-		"--reply-account", "--api-key", redactedAgentCommandArg, "arg_count",
+		"agent command", "provider=openclaw", "agent", "--local", "--json",
+		"--session-id", "--message", redactedAgentCommandArg, "arg_count",
 		"[openclaw:stderr] output suppressed", "openclaw finished",
 	} {
 		if !strings.Contains(output, diagnostic) {

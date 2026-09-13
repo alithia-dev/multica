@@ -17,12 +17,14 @@ const maxLoggedAgentCommandFlagLen = 64
 type agentCommandLogArgs struct {
 	invocationArgs     []string
 	trustedPositionals map[int]string
+	trustedFlags       map[int]string
 }
 
-func newAgentCommandLogArgs(invocationArgs []string, trustedPositionals map[int]string) agentCommandLogArgs {
+func newAgentCommandLogArgs(invocationArgs []string, trustedPositionals, trustedFlags map[int]string) agentCommandLogArgs {
 	return agentCommandLogArgs{
 		invocationArgs:     invocationArgs,
 		trustedPositionals: trustedPositionals,
+		trustedFlags:       trustedFlags,
 	}
 }
 
@@ -42,44 +44,52 @@ func logAgentCommand(logger *slog.Logger, provider string, cmd *exec.Cmd, source
 	if len(cmd.Args) > 1 {
 		args = cmd.Args[1:]
 	}
-	trusted := trustedAgentCommandPositionals(args, source)
+	trustedPositionals, trustedFlags := trustedAgentCommandPositions(args, source)
 	logger.Info("agent command",
 		"provider", provider,
 		"exec", cmd.Path,
-		"args", redactAgentCommandArgs(args, trusted),
+		"args", redactAgentCommandArgs(args, trustedPositionals, trustedFlags),
 		"arg_count", len(args),
 	)
 }
 
-func trustedAgentCommandPositionals(finalArgs []string, source agentCommandLogArgs) map[int]struct{} {
+func trustedAgentCommandPositions(finalArgs []string, source agentCommandLogArgs) (map[int]struct{}, map[int]struct{}) {
 	if len(finalArgs) != len(source.invocationArgs) {
-		return nil
+		return nil, nil
 	}
 	for i, arg := range source.invocationArgs {
 		if finalArgs[i] != arg {
-			return nil
+			return nil, nil
 		}
 	}
 
-	trusted := make(map[int]struct{}, len(source.trustedPositionals))
+	trustedPositionals := make(map[int]struct{}, len(source.trustedPositionals))
 	for index, value := range source.trustedPositionals {
 		if index >= 0 && index < len(source.invocationArgs) && source.invocationArgs[index] == value {
-			trusted[index] = struct{}{}
+			trustedPositionals[index] = struct{}{}
 		}
 	}
-	return trusted
+	trustedFlags := make(map[int]struct{}, len(source.trustedFlags))
+	for index, value := range source.trustedFlags {
+		if index >= 0 && index < len(source.invocationArgs) && source.invocationArgs[index] == value {
+			trustedFlags[index] = struct{}{}
+		}
+	}
+	return trustedPositionals, trustedFlags
 }
 
-func redactAgentCommandArgs(args []string, trustedPositionals map[int]struct{}) []string {
+func redactAgentCommandArgs(args []string, trustedPositionals, trustedFlags map[int]struct{}) []string {
 	redacted := make([]string, len(args))
 	for i, arg := range args {
 		if _, ok := trustedPositionals[i]; ok {
 			redacted[i] = arg
 			continue
 		}
-		if flag, ok := safeAgentCommandFlagName(arg); ok {
-			redacted[i] = flag
-			continue
+		if _, ok := trustedFlags[i]; ok {
+			if flag, safe := safeAgentCommandFlagName(arg); safe {
+				redacted[i] = flag
+				continue
+			}
 		}
 		redacted[i] = redactedAgentCommandArg
 	}
