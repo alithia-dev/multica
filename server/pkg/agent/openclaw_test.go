@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -1083,6 +1086,72 @@ func TestBuildOpenclawArgsFiltersBlockedCustomArgs(t *testing.T) {
 	}
 }
 
+func TestOpenclawCommandLogRedactsPromptRoutesCredentialsAndSubprocessOutput(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+echo 'transaction=row-secret balance=balance-secret token=stderr-token env='$PRIVATE_ENV >&2
+printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":1}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	b := &openclawBackend{cfg: Config{
+		ExecutablePath: fakePath,
+		Env:            map[string]string{"PRIVATE_ENV": "environment-secret"},
+		Logger:         logger,
+	}}
+	session, err := b.Execute(context.Background(), "--private-balance", ExecOptions{
+		CustomArgs: []string{
+			"--channel", "--private-channel",
+			"--reply-to", "--private-target",
+			"--reply-account", "-a",
+			"--api-key", "--private-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for range session.Messages {
+	}
+	if result := <-session.Result; result.Status != "completed" {
+		t.Fatalf("result = %+v, want completed", result)
+	}
+	systemArgs, systemLogArgs := buildOpenclawArgsForCommandLog("task", "system-session", ExecOptions{
+		SystemPrompt: "--private-system-prompt",
+	}, logger)
+	logAgentCommand(logger, "openclaw", exec.Command(fakePath, systemArgs...), systemLogArgs)
+
+	output := logs.String()
+	for _, secret := range []string{
+		"--private-balance", "--private-system-prompt", "--private-channel",
+		"--private-target", "-a", "--private-token", "row-secret",
+		"balance-secret", "stderr-token", "environment-secret",
+	} {
+		if strings.Contains(output, secret) {
+			t.Errorf("OpenClaw log exposed %q: %s", secret, output)
+		}
+	}
+	for _, diagnostic := range []string{
+		"agent command", "provider=openclaw", "agent", "--local", "--json",
+		"--session-id", "--message", redactedAgentCommandArg, "arg_count",
+		"[openclaw:stderr] output suppressed", "openclaw finished",
+	} {
+		if !strings.Contains(output, diagnostic) {
+			t.Errorf("OpenClaw log omitted safe diagnostic %q: %s", diagnostic, output)
+		}
+	}
+}
+
 // ── Mode matrix (issue #3260) ──
 //
 // `openclaw agent` runs through the Gateway by default; `--local` is the
@@ -1425,6 +1494,462 @@ func TestOpenclawProcessOutputStdoutFixture(t *testing.T) {
 	}
 }
 
+func TestOpenclawExecuteStreamsSafeProgressBeforeFinalResult(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+printf '%s\n' '{"type":"lifecycle","phase":"source_opened"}'
+printf '%s\n' '{"type":"lifecycle","phase":"preflight_complete"}'
+printf '%s\n' '{"type":"lifecycle","phase":"preflight_complete"}'
+printf '%s\n' '{"type":"lifecycle","phase":"write_started"}'
+printf '%s\n' '{"type":"lifecycle","phase":"readback_started"}'
+sleep 0.05
+echo 'token=super-secret transaction=private-row' >&2
+printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":50}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{
+		cfg:             Config{ExecutablePath: fakePath, Logger: slog.Default()},
+		progressCadence: 10 * time.Millisecond,
+	}
+	session, err := b.Execute(context.Background(), "sensitive prompt", ExecOptions{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	var first Message
+	select {
+	case msg := <-session.Messages:
+		first = msg
+		if msg.Content != openclawStartedMessage {
+			t.Fatalf("first message = %q, want %q", msg.Content, openclawStartedMessage)
+		}
+	case result := <-session.Result:
+		t.Fatalf("result arrived before progress: %+v", result)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial progress")
+	}
+
+	messages := []Message{first}
+	for msg := range session.Messages {
+		messages = append(messages, msg)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "final answer" {
+		t.Fatalf("result = %+v, want completed final answer", result)
+	}
+
+	var contents []string
+	for _, msg := range messages {
+		if msg.Type == MessageText {
+			contents = append(contents, msg.Content)
+		}
+		if strings.Contains(msg.Content, "sensitive prompt") || strings.Contains(msg.Content, "super-secret") || strings.Contains(msg.Content, "private-row") {
+			t.Fatalf("progress leaked prompt or subprocess data: %q", msg.Content)
+		}
+	}
+	for _, want := range []string{
+		openclawStartedMessage,
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+		openclawFinalizingMessage,
+		"final answer",
+		openclawCompletedMessage,
+	} {
+		if !containsOpenclawString(contents, want) {
+			t.Errorf("missing streamed message %q in %q", want, contents)
+		}
+		if countOpenclawString(contents, want) != 1 {
+			t.Errorf("message %q was not deduplicated in %q", want, contents)
+		}
+	}
+}
+
+func TestOpenclawSilentBackendDoesNotInventPhases(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+sleep 0.06
+printf '%s\n' '{"payloads":[{"text":"no-op final"}],"meta":{"durationMs":60}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{
+		cfg:             Config{ExecutablePath: fakePath, Logger: slog.Default()},
+		progressCadence: 10 * time.Millisecond,
+	}
+	session, err := b.Execute(context.Background(), "research only", ExecOptions{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	var contents []string
+	for msg := range session.Messages {
+		contents = append(contents, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "no-op final" {
+		t.Fatalf("result = %+v, want completed no-op final", result)
+	}
+	if !containsOpenclawString(contents, openclawWaitingMessage) {
+		t.Fatalf("silent backend missing truthful heartbeat: %q", contents)
+	}
+	for _, falseClaim := range []string{
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+	} {
+		if containsOpenclawString(contents, falseClaim) {
+			t.Errorf("silent backend invented phase %q in %q", falseClaim, contents)
+		}
+	}
+}
+
+func TestOpenclawLifecycleProgressRequiresExplicitAllowlistedEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		event openclawEvent
+		want  string
+	}{
+		{event: openclawEvent{Type: "lifecycle", Phase: "source_opened"}, want: openclawSourceOpenedMessage},
+		{event: openclawEvent{Type: "lifecycle", Phase: "preflight-complete"}, want: openclawPreflightCompleteMessage},
+		{event: openclawEvent{Type: "lifecycle", Phase: "write started"}, want: openclawWriteStartedMessage},
+		{event: openclawEvent{Type: "lifecycle", Phase: "readback_replay_started"}, want: openclawReadbackStartedMessage},
+		{event: openclawEvent{Type: "tool_use", Phase: "write_started"}},
+		{event: openclawEvent{Type: "lifecycle", Phase: "verification_complete"}},
+		{event: openclawEvent{Type: "text", Text: "preflight complete"}},
+	}
+	for _, tt := range tests {
+		if got := openclawLifecycleProgress(tt.event); got != tt.want {
+			t.Errorf("openclawLifecycleProgress(%+v) = %q, want %q", tt.event, got, tt.want)
+		}
+	}
+}
+
+func TestOpenclawProgressUsesOnlyRedactionSafeConstants(t *testing.T) {
+	t.Parallel()
+
+	messages := []string{
+		openclawStartedMessage,
+		openclawWaitingMessage,
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+		openclawFinalizingMessage,
+		openclawCompletedMessage,
+		openclawFailedMessage,
+	}
+	for _, message := range messages {
+		for _, forbidden := range []string{"token", "credential", "transaction", "prompt", "tool", "/home/", `c:\\`} {
+			if strings.Contains(strings.ToLower(message), forbidden) {
+				t.Fatalf("progress %q contains forbidden data-shaped text %q", message, forbidden)
+			}
+		}
+	}
+}
+
+func TestOpenclawExecuteFinalOnlyBackendCompatibility(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+printf '%s\n' '{"payloads":[{"text":"legacy final"}],"meta":{"durationMs":1}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{cfg: Config{ExecutablePath: fakePath, Logger: slog.Default()}}
+	session, err := b.Execute(context.Background(), "prompt", ExecOptions{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var contents []string
+	for msg := range session.Messages {
+		contents = append(contents, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "legacy final" {
+		t.Fatalf("result = %+v, want completed legacy final", result)
+	}
+	for _, want := range []string{openclawStartedMessage, openclawFinalizingMessage, "legacy final", openclawCompletedMessage} {
+		if !containsOpenclawString(contents, want) {
+			t.Errorf("missing message %q in %q", want, contents)
+		}
+	}
+	for _, falseClaim := range []string{
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+	} {
+		if containsOpenclawString(contents, falseClaim) {
+			t.Errorf("final-only backend invented phase %q in %q", falseClaim, contents)
+		}
+	}
+}
+
+func TestOpenclawProgressMirrorsToDiscord(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "openclaw")
+	deliveryLog := filepath.Join(dir, "delivery.log")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+if [ "$1" = "message" ]; then
+  printf '%s\n' "$*" >> "$DELIVERY_LOG"
+  exit 0
+fi
+sleep 0.08
+printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":80}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{
+		cfg: Config{
+			ExecutablePath: fakePath,
+			Env:            map[string]string{"DELIVERY_LOG": deliveryLog},
+			Logger:         slog.Default(),
+		},
+		progressCadence: 10 * time.Millisecond,
+	}
+	session, err := b.Execute(context.Background(), "sensitive prompt", ExecOptions{
+		CustomArgs: []string{"--channel", "discord", "--to", "channel:123", "--deliver"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var multicaMessages []string
+	for msg := range session.Messages {
+		multicaMessages = append(multicaMessages, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "final answer" {
+		t.Fatalf("result = %+v", result)
+	}
+
+	deliveredBytes, err := os.ReadFile(deliveryLog)
+	if err != nil {
+		t.Fatalf("read delivery log: %v", err)
+	}
+	delivered := string(deliveredBytes)
+	for _, want := range []string{openclawStartedMessage, openclawWaitingMessage, openclawFinalizingMessage, openclawCompletedMessage} {
+		if !containsOpenclawString(multicaMessages, want) {
+			t.Errorf("Multica surface missing %q", want)
+		}
+		if strings.Count(delivered, want) != 1 {
+			t.Errorf("Discord surface count for %q = %d, want 1; log=%q", want, strings.Count(delivered, want), delivered)
+		}
+	}
+	for _, forbidden := range []string{"sensitive prompt", "token=", "transaction="} {
+		if strings.Contains(delivered, forbidden) {
+			t.Fatalf("Discord progress leaked sensitive data %q: %q", forbidden, delivered)
+		}
+	}
+}
+
+func TestOpenclawDiscordFailureDoesNotSuppressMulticaOrFinalResult(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+if [ "$1" = "message" ]; then
+  exit 42
+fi
+sleep 0.03
+printf '%s\n' '{"payloads":[{"text":"final survives"}],"meta":{"durationMs":30}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{
+		cfg:             Config{ExecutablePath: fakePath, Logger: slog.Default()},
+		progressCadence: 5 * time.Millisecond,
+	}
+	session, err := b.Execute(context.Background(), "prompt", ExecOptions{
+		CustomArgs: []string{"--channel=discord", "--to=channel:123", "--deliver"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var messages []string
+	for msg := range session.Messages {
+		messages = append(messages, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "final survives" {
+		t.Fatalf("Discord failure changed final result: %+v", result)
+	}
+	for _, want := range []string{openclawStartedMessage, openclawFinalizingMessage, "final survives", openclawCompletedMessage} {
+		if !containsOpenclawString(messages, want) {
+			t.Errorf("Multica surface missing %q after Discord failure: %q", want, messages)
+		}
+	}
+}
+
+func TestOpenclawMulticaBackpressureDoesNotSuppressDiscord(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "openclaw")
+	deliveryLog := filepath.Join(dir, "delivery.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$DELIVERY_LOG"
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{cfg: Config{
+		Env:    map[string]string{"DELIVERY_LOG": deliveryLog},
+		Logger: slog.Default(),
+	}}
+	ch := make(chan Message, 1)
+	ch <- Message{Type: MessageText, Content: "occupy Multica buffer"}
+	b.publishSafeProgress(context.Background(), ch, fakePath, "", &openclawProgressDelivery{
+		channel: "discord",
+		target:  "channel:123",
+	}, openclawStartedMessage)
+
+	if got := (<-ch).Content; got != "occupy Multica buffer" {
+		t.Fatalf("full Multica buffer unexpectedly changed: %q", got)
+	}
+	deliveredBytes, err := os.ReadFile(deliveryLog)
+	if err != nil {
+		t.Fatalf("read delivery log: %v", err)
+	}
+	if !strings.Contains(string(deliveredBytes), openclawStartedMessage) {
+		t.Fatalf("Discord delivery was suppressed by Multica backpressure: %q", deliveredBytes)
+	}
+}
+
+func TestParseOpenclawProgressDelivery(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want *openclawProgressDelivery
+	}{
+		{name: "discord target", args: []string{"agent", "--channel", "discord", "--to", "123", "--deliver"}, want: &openclawProgressDelivery{channel: "discord", target: "123"}},
+		{name: "equals and overrides", args: []string{"agent", "--channel=slack", "--to=old", "--reply-channel=discord", "--reply-to=channel:456", "--reply-account=grit", "--deliver"}, want: &openclawProgressDelivery{channel: "discord", target: "channel:456", account: "grit"}},
+		{name: "no deliver", args: []string{"agent", "--channel", "discord", "--to", "123"}},
+		{name: "non-discord", args: []string{"agent", "--channel", "slack", "--to", "123", "--deliver"}},
+		{name: "prompt cannot inject route", args: []string{"agent", "--message", "--channel discord --to 123 --deliver"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseOpenclawProgressDelivery(tt.args)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOpenclawProgressStopsOnCancellation(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+exec sleep 10
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b := &openclawBackend{
+		cfg:             Config{ExecutablePath: fakePath, Logger: slog.Default()},
+		progressCadence: 10 * time.Millisecond,
+	}
+	session, err := b.Execute(ctx, "prompt", ExecOptions{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if msg := <-session.Messages; msg.Content != openclawStartedMessage {
+		t.Fatalf("first message = %q", msg.Content)
+	}
+	cancel()
+
+	var contents []string
+	for msg := range session.Messages {
+		contents = append(contents, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "aborted" || result.Error != "execution cancelled" {
+		t.Fatalf("result = %+v, want aborted cancellation", result)
+	}
+	if containsOpenclawString(contents, openclawFinalizingMessage) {
+		t.Fatalf("cancelled run emitted finalizing checkpoint: %q", contents)
+	}
+}
+
+func containsOpenclawString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func countOpenclawString(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
+}
+
 // ── Version gate tests (MUL-1803) ──
 
 func TestParseOpenclawVersion(t *testing.T) {
@@ -1554,14 +2079,20 @@ func TestOpenclawExecuteAllowsCurrentVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute returned synchronous error past the version gate: %v", err)
 	}
-	go func() {
-		for range session.Messages {
-		}
-	}()
+	var messages []Message
+	for msg := range session.Messages {
+		messages = append(messages, msg)
+	}
 	select {
 	case result := <-session.Result:
 		if strings.Contains(result.Error, "openclaw update") {
 			t.Errorf("version gate fired for a current version: %q", result.Error)
+		}
+		if result.Status != "failed" || result.Error != openclawNoParseableOutput {
+			t.Errorf("silent backend result = %+v, want canonical no-output failure", result)
+		}
+		if len(messages) == 0 || messages[0].Content != openclawStartedMessage {
+			t.Errorf("silent backend did not emit safe startup progress: %+v", messages)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for result")

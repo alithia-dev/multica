@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1124,6 +1125,176 @@ func (b *transcriptBackend) Execute(_ context.Context, _ string, _ agent.ExecOpt
 		resCh <- agent.Result{Status: "completed", Output: "done", SessionID: "sess-2"}
 	}
 	return &agent.Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func TestExecuteAndDrain_OpenclawContentNeverEntersDaemonLogs(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+printf '%s\n' '{"type":"text","sessionId":"session-sentinel","text":"prompt-sentinel route-sentinel account-sentinel transaction-sentinel"}'
+printf '%s\n' '{"type":"tool_use","tool":"tool-name-sentinel","callId":"call-id-sentinel","input":{"value":"tool-input-sentinel"}}'
+printf '%s\n' '{"type":"tool_result","callId":"call-id-sentinel","text":"tool-output-sentinel"}'
+printf '%s\n' '{"type":"error","text":"credential-sentinel token-sentinel balance-sentinel"}'
+printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-sentinel"}'
+`
+	if err := os.WriteFile(fakePath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake openclaw: %v", err)
+	}
+
+	var backendLogs bytes.Buffer
+	backendLog := slog.New(slog.NewTextHandler(&backendLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	var taskLogs bytes.Buffer
+	taskLog := slog.New(slog.NewTextHandler(&taskLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	backend, err := agent.New("openclaw", agent.Config{ExecutablePath: fakePath, Logger: backendLog})
+	if err != nil {
+		t.Fatalf("new OpenClaw backend: %v", err)
+	}
+	d, rec := newTranscriptRecorder(t)
+	result, _, err := d.executeAndDrain(context.Background(), backend, "task", agent.ExecOptions{}, taskLog, "task-log-redaction", new(atomic.Int32))
+	if err != nil {
+		t.Fatalf("executeAndDrain: %v", err)
+	}
+	if result.Status != "failed" || result.Error != "environment-sentinel" {
+		t.Fatalf("user-facing result changed: %+v", result)
+	}
+	logAgentResultDetail(taskLog, result)
+
+	transcript := rec.snapshot()
+	if len(transcript) == 0 {
+		t.Fatal("expected user-facing transcript content to be preserved")
+	}
+	var transcriptContent strings.Builder
+	for _, message := range transcript {
+		transcriptContent.WriteString(message.Content)
+	}
+	for _, preserved := range []string{"prompt-sentinel", "credential-sentinel", "environment-sentinel"} {
+		if !strings.Contains(transcriptContent.String(), preserved) {
+			t.Errorf("user-facing transcript dropped %q: %+v", preserved, transcript)
+		}
+	}
+	var toolUsePreserved, toolResultPreserved bool
+	for _, message := range transcript {
+		if message.Type == "tool_use" && message.Tool == "tool-name-sentinel" && message.Input["value"] == "tool-input-sentinel" {
+			toolUsePreserved = true
+		}
+		if message.Type == "tool_result" && message.Tool == "tool-name-sentinel" && message.Output == "tool-output-sentinel" {
+			toolResultPreserved = true
+		}
+	}
+	if !toolUsePreserved || !toolResultPreserved {
+		t.Errorf("tool transcript behavior changed: %+v", transcript)
+	}
+	for name, logOutput := range map[string]string{
+		"backend": backendLogs.String(),
+		"task":    taskLogs.String(),
+	} {
+		for _, sentinel := range []string{
+			"prompt-sentinel", "route-sentinel", "account-sentinel",
+			"credential-sentinel", "token-sentinel", "balance-sentinel",
+			"transaction-sentinel", "environment-sentinel", "session-sentinel",
+			"tool-name-sentinel", "call-id-sentinel", "tool-input-sentinel", "tool-output-sentinel",
+		} {
+			if strings.Contains(logOutput, sentinel) {
+				t.Errorf("%s log exposed %q: %s", name, sentinel, logOutput)
+			}
+		}
+	}
+	checks := []struct {
+		logOutput   string
+		diagnostics []string
+	}{
+		{backendLogs.String(), []string{"openclaw error event", "openclaw lifecycle failure"}},
+		{taskLogs.String(), []string{"agent text observed", "content_bytes", "tool use observed", "tool result observed", "tool_name_bytes", "call_id_present", "agent error observed", "agent result detail", "agent_error_bytes", "session_id_present"}},
+	}
+	for _, check := range checks {
+		for _, diagnostic := range check.diagnostics {
+			if !strings.Contains(check.logOutput, diagnostic) {
+				t.Errorf("log omitted safe diagnostic %q: %s", diagnostic, check.logOutput)
+			}
+		}
+	}
+}
+
+func TestHandleTask_BackendStartErrorNeverEntersDaemonLogs(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"running"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var logs bytes.Buffer
+	d := &Daemon{
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"rt-log-redaction": {ID: "rt-log-redaction", Provider: "openclaw"}},
+		cancelPollInterval: time.Hour,
+	}
+	d.runner = taskRunnerFunc(func(_ context.Context, _ Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
+		return TaskResult{}, errors.New("backend-start-error-sentinel")
+	})
+
+	d.handleTask(context.Background(), Task{
+		ID:        "task-start-log-redaction",
+		RuntimeID: "rt-log-redaction",
+		IssueID:   "issue-log-redaction",
+		Agent:     &AgentData{Name: "test-agent"},
+	}, 0)
+
+	logOutput := logs.String()
+	if strings.Contains(logOutput, "backend-start-error-sentinel") {
+		t.Fatalf("outer task log exposed backend start error: %s", logOutput)
+	}
+	for _, diagnostic := range []string{"task failed", "error_bytes"} {
+		if !strings.Contains(logOutput, diagnostic) {
+			t.Errorf("outer task log omitted %q: %s", diagnostic, logOutput)
+		}
+	}
+}
+
+func TestGateResumeLogsPresenceNotProviderSessionID(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	task := Task{PriorSessionID: "provider-session-sentinel", PriorWorkDir: "/prior/workdir"}
+	taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+
+	if gateResumeToReusedWorkdir(&task, &taskCtx, "/new/workdir", logger) {
+		t.Fatal("different workdir unexpectedly reused prior session")
+	}
+	logOutput := logs.String()
+	if strings.Contains(logOutput, "provider-session-sentinel") {
+		t.Fatalf("resume gate log exposed provider session id: %s", logOutput)
+	}
+	for _, diagnostic := range []string{"dropping prior session", "session_id_present=true"} {
+		if !strings.Contains(logOutput, diagnostic) {
+			t.Errorf("resume gate log omitted %q: %s", diagnostic, logOutput)
+		}
+	}
+
+	logs.Reset()
+	logResumingSession(logger)
+	logOutput = logs.String()
+	if strings.Contains(logOutput, "provider-session-sentinel") {
+		t.Fatalf("normal resume log exposed provider session id: %s", logOutput)
+	}
+	for _, diagnostic := range []string{"resuming session", "session_id_present=true"} {
+		if !strings.Contains(logOutput, diagnostic) {
+			t.Errorf("normal resume log omitted %q: %s", diagnostic, logOutput)
+		}
+	}
 }
 
 // transcriptRecorder collects the task messages a daemon reports to its

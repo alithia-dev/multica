@@ -29,6 +29,26 @@ const openclawNoParseableOutput = "openclaw returned no parseable output"
 // of "openclaw returned no parseable output".
 const minOpenclawVersion = "2026.5.5"
 
+// openclawProgressCadence controls when the adapter emits one truthful fallback
+// heartbeat while waiting for a final-only OpenClaw backend. Named phases are
+// emitted only when OpenClaw provides an explicit lifecycle event.
+const openclawProgressCadence = 30 * time.Second
+const openclawProgressDeliveryTimeout = 5 * time.Second
+
+// Progress messages are intentionally static. Never interpolate the prompt,
+// paths, tool data, subprocess output, or environment values here: task
+// messages are persisted and broadcast to operators while the run is active.
+const openclawStartedMessage = "Starting the requested run: GRIT will execute the assigned task and deliver its final result.\n"
+const openclawWaitingMessage = "OpenClaw is still running; no phase transition has been reported.\n"
+const openclawSourceOpenedMessage = "Source/package opened.\n"
+const openclawPreflightCompleteMessage = "Preflight complete.\n"
+const openclawWriteStartedMessage = "Write/apply phase started.\n"
+const openclawReadbackStartedMessage = "Readback/replay phase started.\n"
+
+const openclawFinalizingMessage = "Finalizing the requested run.\n"
+const openclawCompletedMessage = "GRIT finished the requested run successfully; the final result was delivered.\n"
+const openclawFailedMessage = "GRIT finished the requested run with an error; the final result was preserved.\n"
+
 // openclawVersionPattern extracts a three-segment dotted version from
 // arbitrary `openclaw --version` output (e.g. "openclaw 2026.5.5",
 // "openclaw v2026.5.5 c37871e").
@@ -50,6 +70,9 @@ var openclawBlockedArgs = map[string]blockedArgMode{
 // stdout — similar to the opencode backend.
 type openclawBackend struct {
 	cfg Config
+	// progressCadence is a test seam. Zero selects
+	// openclawProgressCadence; production construction never sets it.
+	progressCadence time.Duration
 }
 
 func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
@@ -72,27 +95,27 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("multica-%d", time.Now().UnixNano())
 	}
-	args := buildOpenclawArgs(prompt, sessionID, opts, b.cfg.Logger)
+	args, commandLogArgs := buildOpenclawArgsForCommandLog(prompt, sessionID, opts, b.cfg.Logger)
+	progressDelivery := parseOpenclawProgressDelivery(args)
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	logAgentCommand(b.cfg.Logger, "openclaw", cmd, commandLogArgs)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
 	cmd.Env = buildEnv(b.cfg.Env)
 
-	// openclaw writes its --json output to stdout. Stderr carries log
-	// overflow (security warnings, tool errors, etc.) — capture it via a
-	// log writer so it surfaces in daemon logs without being fed into the
-	// JSON parser.
+	// openclaw writes its --json output to stdout. Stderr can carry prompts,
+	// tool output, or secrets, so preserve only the fact that output occurred;
+	// never feed subprocess-controlled content into daemon logs or the parser.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("openclaw stdout pipe: %w", err)
 	}
-	cmd.Stderr = newLogWriter(b.cfg.Logger, "[openclaw:stderr] ")
+	cmd.Stderr = newRedactedSubprocessLogWriter(b.cfg.Logger, "[openclaw:stderr] ")
 
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -103,6 +126,10 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	trySend(msgCh, Message{Type: MessageText, Content: openclawStartedMessage})
+	phaseCh := make(chan string, 16)
+	progressDone := make(chan struct{})
+	go b.streamSafeProgress(runCtx, msgCh, progressDone, phaseCh, execPath, opts.Cwd, progressDelivery)
 
 	// Close stdout when the context is cancelled so the scanner unblocks.
 	go func() {
@@ -116,7 +143,18 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		defer close(resCh)
 
 		startTime := time.Now()
-		scanResult := b.processOutput(stdout, msgCh)
+		stdoutBytes, readErr := readOpenclawOutput(runCtx, stdout, phaseCh)
+		close(phaseCh)
+		<-progressDone
+		if runCtx.Err() == nil {
+			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, openclawFinalizingMessage)
+		}
+		var scanResult openclawEventResult
+		if readErr != nil {
+			scanResult = openclawEventResult{status: "failed", errMsg: fmt.Sprintf("read stdout: %v", readErr)}
+		} else {
+			scanResult = b.processOutput(bytes.NewReader(stdoutBytes), msgCh)
+		}
 
 		// Wait for process exit.
 		exitErr := cmd.Wait()
@@ -134,6 +172,13 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		}
 
 		b.cfg.Logger.Info("openclaw finished", "pid", cmd.Process.Pid, "status", scanResult.status, "duration", duration.Round(time.Millisecond).String())
+		if runCtx.Err() == nil {
+			completion := openclawCompletedMessage
+			if scanResult.status != "completed" {
+				completion = openclawFailedMessage
+			}
+			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, completion)
+		}
 
 		// Build usage map. Prefer the model openclaw reported in
 		// `meta.agentMeta.model` (the actual LLM, e.g. `deepseek-chat`).
@@ -167,6 +212,182 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
+// streamSafeProgress keeps final-result-only OpenClaw runs observable without
+// inventing work. Named phases require explicit lifecycle evidence from the
+// subprocess. A silent backend receives one throttled, truthful heartbeat.
+func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}, phases <-chan string, execPath, cwd string, delivery *openclawProgressDelivery) {
+	defer close(done)
+
+	cadence := b.progressCadence
+	if cadence <= 0 {
+		cadence = openclawProgressCadence
+	}
+
+	b.deliverSafeProgress(ctx, execPath, cwd, delivery, openclawStartedMessage)
+	seen := make(map[string]struct{})
+	waitingEmitted := false
+	ticker := time.NewTicker(cadence)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case content, ok := <-phases:
+			if !ok {
+				return
+			}
+			if _, duplicate := seen[content]; duplicate {
+				continue
+			}
+			seen[content] = struct{}{}
+			b.publishSafeProgress(ctx, ch, execPath, cwd, delivery, content)
+		case <-ticker.C:
+			if waitingEmitted || len(seen) > 0 {
+				continue
+			}
+			waitingEmitted = true
+			b.publishSafeProgress(ctx, ch, execPath, cwd, delivery, openclawWaitingMessage)
+		}
+	}
+}
+
+// readOpenclawOutput preserves stdout byte-for-byte for the existing result
+// parser while recognizing only explicit, line-delimited lifecycle events.
+// Tool names, arguments, output, and free-form text never become progress.
+func readOpenclawOutput(ctx context.Context, r io.Reader, phases chan<- string) ([]byte, error) {
+	reader := bufio.NewReader(r)
+	var output bytes.Buffer
+	seen := make(map[string]struct{})
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			_, _ = output.Write(line)
+			if event, ok := tryParseOpenclawEvent(strings.TrimSpace(string(line))); ok {
+				if content := openclawLifecycleProgress(event); content != "" {
+					if _, duplicate := seen[content]; !duplicate {
+						seen[content] = struct{}{}
+						select {
+						case phases <- content:
+						case <-ctx.Done():
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return output.Bytes(), nil
+			}
+			return output.Bytes(), err
+		}
+	}
+}
+
+// openclawLifecycleProgress maps an explicit backend lifecycle phase to a
+// static, redaction-safe operator message. Unknown phases are ignored.
+func openclawLifecycleProgress(event openclawEvent) string {
+	if event.Type != "lifecycle" {
+		return ""
+	}
+	phase := strings.ToLower(strings.TrimSpace(event.Phase))
+	phase = strings.NewReplacer("-", "_", " ", "_").Replace(phase)
+	switch phase {
+	case "source_opened", "source_package_opened":
+		return openclawSourceOpenedMessage
+	case "preflight_complete":
+		return openclawPreflightCompleteMessage
+	case "write_started", "apply_started", "write_apply_started":
+		return openclawWriteStartedMessage
+	case "readback_started", "replay_started", "readback_replay_started":
+		return openclawReadbackStartedMessage
+	default:
+		return ""
+	}
+}
+
+// openclawProgressDelivery is derived only from explicit OpenClaw delivery
+// flags. A nil route means the run has no originating Discord surface and
+// progress remains Multica-only.
+type openclawProgressDelivery struct {
+	channel string
+	target  string
+	account string
+}
+
+// parseOpenclawProgressDelivery extracts the same explicit Discord destination
+// used by the primary `openclaw agent --deliver` invocation. It stops at
+// --message so prompt text can never be interpreted as routing flags.
+func parseOpenclawProgressDelivery(args []string) *openclawProgressDelivery {
+	values := make(map[string]string)
+	deliver := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--message" || strings.HasPrefix(arg, "--message=") {
+			break
+		}
+		if arg == "--deliver" {
+			deliver = true
+			continue
+		}
+		for _, flag := range []string{"--channel", "--reply-channel", "--to", "--reply-to", "--reply-account"} {
+			if arg == flag && i+1 < len(args) {
+				i++
+				values[flag] = args[i]
+				break
+			}
+			if strings.HasPrefix(arg, flag+"=") {
+				values[flag] = strings.TrimPrefix(arg, flag+"=")
+				break
+			}
+		}
+	}
+	channel := values["--reply-channel"]
+	if channel == "" {
+		channel = values["--channel"]
+	}
+	target := values["--reply-to"]
+	if target == "" {
+		target = values["--to"]
+	}
+	if !deliver || !strings.EqualFold(channel, "discord") || strings.TrimSpace(target) == "" {
+		return nil
+	}
+	return &openclawProgressDelivery{
+		channel: "discord",
+		target:  target,
+		account: values["--reply-account"],
+	}
+}
+
+func (b *openclawBackend) publishSafeProgress(ctx context.Context, ch chan<- Message, execPath, cwd string, delivery *openclawProgressDelivery, content string) {
+	trySend(ch, Message{Type: MessageText, Content: content})
+	b.deliverSafeProgress(ctx, execPath, cwd, delivery, content)
+}
+
+// deliverSafeProgress mirrors an allowlisted checkpoint to Discord. Delivery
+// is best-effort and independently bounded: an unavailable Discord surface
+// must never suppress Multica progress or alter the agent's final result.
+func (b *openclawBackend) deliverSafeProgress(ctx context.Context, execPath, cwd string, delivery *openclawProgressDelivery, content string) {
+	if delivery == nil {
+		return
+	}
+	deliveryCtx, cancel := context.WithTimeout(ctx, openclawProgressDeliveryTimeout)
+	defer cancel()
+	args := []string{"message", "send", "--channel", delivery.channel, "--target", delivery.target, "--message", content, "--silent"}
+	if delivery.account != "" {
+		args = append(args, "--account", delivery.account)
+	}
+	cmd := exec.CommandContext(deliveryCtx, execPath, args...)
+	hideAgentWindow(cmd)
+	cmd.Dir = cwd
+	cmd.Env = buildEnv(b.cfg.Env)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		b.cfg.Logger.Warn("openclaw progress delivery failed", "channel", delivery.channel, "error", err)
+	}
+}
+
 // buildOpenclawArgs assembles the argv for a one-shot `openclaw agent` invocation.
 //
 // The CLI only accepts --local, --json, --session-id, --timeout, --message (and
@@ -185,13 +406,31 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 // --local stays in openclawBlockedArgs so users cannot smuggle it back in via
 // custom_args under gateway mode (mode is the single source of truth).
 func buildOpenclawArgs(prompt, sessionID string, opts ExecOptions, logger *slog.Logger) []string {
+	args, _ := buildOpenclawArgsForCommandLog(prompt, sessionID, opts, logger)
+	return args
+}
+
+// buildOpenclawArgsForCommandLog assembles argv together with the exact
+// adapter-owned positions that may remain visible in command diagnostics.
+// Custom arguments and every value position are deliberately untrusted, even
+// when their content happens to look like valid short or long flag syntax.
+func buildOpenclawArgsForCommandLog(prompt, sessionID string, opts ExecOptions, logger *slog.Logger) ([]string, agentCommandLogArgs) {
 	args := []string{"agent"}
-	if opts.OpenclawMode != "gateway" {
-		args = append(args, "--local")
+	trustedPositionals := map[int]string{0: "agent"}
+	trustedFlags := make(map[int]string)
+	appendTrustedFlag := func(flag string) {
+		trustedFlags[len(args)] = flag
+		args = append(args, flag)
 	}
-	args = append(args, "--json", "--session-id", sessionID)
+	if opts.OpenclawMode != "gateway" {
+		appendTrustedFlag("--local")
+	}
+	appendTrustedFlag("--json")
+	appendTrustedFlag("--session-id")
+	args = append(args, sessionID)
 	if opts.Timeout > 0 {
-		args = append(args, "--timeout", fmt.Sprintf("%d", int(opts.Timeout.Seconds())))
+		appendTrustedFlag("--timeout")
+		args = append(args, fmt.Sprintf("%d", int(opts.Timeout.Seconds())))
 	}
 	// OpenClaw binds models to pre-registered agents at `openclaw agents
 	// add/update --model` time; the daemon selects one at runtime by
@@ -203,15 +442,17 @@ func buildOpenclawArgs(prompt, sessionID string, opts ExecOptions, logger *slog.
 	// backward compatibility with existing configs.
 	customArgs := filterCustomArgs(opts.CustomArgs, openclawBlockedArgs, logger)
 	if opts.Model != "" && !customArgsContains(customArgs, "--agent") {
-		args = append(args, "--agent", opts.Model)
+		appendTrustedFlag("--agent")
+		args = append(args, opts.Model)
 	}
 	args = append(args, customArgs...)
 
 	if opts.SystemPrompt != "" {
 		prompt = opts.SystemPrompt + "\n\n" + prompt
 	}
-	args = append(args, "--message", prompt)
-	return args
+	appendTrustedFlag("--message")
+	args = append(args, prompt)
+	return args, newAgentCommandLogArgs(args, trustedPositionals, trustedFlags)
 }
 
 // customArgsContains reports whether args contains the given flag
@@ -390,7 +631,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				})
 			case "error":
 				errMsg := event.errorMessage()
-				b.cfg.Logger.Warn("openclaw error event", "error", errMsg)
+				b.cfg.Logger.Warn("openclaw error event", "detail", redactedAgentCommandArg)
 				trySend(ch, Message{Type: MessageError, Content: errMsg})
 				finalStatus = "failed"
 				finalError = errMsg
@@ -398,7 +639,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				phase := event.Phase
 				if phase == "error" || phase == "failed" || phase == "cancelled" {
 					errMsg := event.errorMessage()
-					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "error", errMsg)
+					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "detail", redactedAgentCommandArg)
 					trySend(ch, Message{Type: MessageError, Content: errMsg})
 					finalStatus = "failed"
 					finalError = errMsg
@@ -436,7 +677,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 		}
 
 		// Not JSON — treat as log line.
-		b.cfg.Logger.Debug("[openclaw:stdout] " + line)
+		b.cfg.Logger.Debug("[openclaw:stdout] unstructured output suppressed")
 		rawLines = append(rawLines, line)
 	}
 

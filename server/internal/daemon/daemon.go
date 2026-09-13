@@ -2947,7 +2947,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}
 
 	if err != nil {
-		taskLog.Error("task failed", "error", err)
+		taskLog.Error("task failed", "error_bytes", len(err.Error()))
 		// runTask returned without a TaskResult, so we don't have a SessionID
 		// to forward — best we can do is record the failure.
 		// MUL-2946: route the bare error string through the canonical
@@ -3268,7 +3268,7 @@ func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, e
 	reused := task.PriorWorkDir != "" && envWorkDir == task.PriorWorkDir
 	if !reused && task.PriorSessionID != "" {
 		taskLog.Info("dropping prior session: workdir not reused, per-cwd session cannot resolve",
-			"session_id", task.PriorSessionID,
+			"session_id_present", true,
 			"prior_workdir", task.PriorWorkDir,
 			"workdir", envWorkDir,
 		)
@@ -3827,7 +3827,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"reused", reused,
 	)
 	if task.PriorSessionID != "" {
-		taskLog.Info("resuming session", "session_id", task.PriorSessionID)
+		logResumingSession(taskLog)
 	}
 
 	taskStart := time.Now()
@@ -3954,11 +3954,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// failure (no session established) from a failure during actual execution.
 	if result.Status == "failed" && task.PriorSessionID != "" && result.SessionID == "" {
 		firstUsage := result.Usage
-		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
+		taskLog.Warn("session resume failed, retrying with fresh session", "error_bytes", len(result.Error))
 		execOpts.ResumeSessionID = ""
 		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, &msgSeq)
 		if retryErr != nil {
-			taskLog.Error("fresh session also failed to start", "error", retryErr)
+			taskLog.Error("fresh session also failed to start", "error_bytes", len(retryErr.Error()))
 		} else {
 			result = retryResult
 			result.Usage = mergeUsage(firstUsage, result.Usage)
@@ -3972,13 +3972,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"duration", elapsed.String(),
 		"tools", tools,
 	)
-	taskLog.Debug("agent result detail",
-		"status", result.Status,
-		"output_bytes", len(result.Output),
-		"session_id", result.SessionID,
-		"models_with_usage", len(result.Usage),
-		"agent_error", result.Error,
-	)
+	logAgentResultDetail(taskLog, result)
 
 	// Convert agent usage map to task usage entries.
 	var usageEntries []TaskUsageEntry
@@ -4147,6 +4141,25 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 }
 
+// logAgentResultDetail records only typed metadata. Result output and errors
+// are subprocess-controlled and may contain prompts, financial rows, route
+// identifiers, credentials, tokens, or environment-derived values.
+func logAgentResultDetail(taskLog *slog.Logger, result agent.Result) {
+	taskLog.Debug("agent result detail",
+		"status", result.Status,
+		"output_bytes", len(result.Output),
+		"session_id_present", result.SessionID != "",
+		"models_with_usage", len(result.Usage),
+		"agent_error_bytes", len(result.Error),
+	)
+}
+
+// logResumingSession intentionally accepts no session value: provider session
+// identifiers are operational state, not safe daemon-log diagnostics.
+func logResumingSession(taskLog *slog.Logger) {
+	taskLog.Info("resuming session", "session_id_present", true)
+}
+
 // executeAndDrain runs a backend, drains its message stream (forwarding to the
 // server), and waits for the final result. msgSeq numbers the reported task
 // messages and is owned by the caller so a same-task retry continues the
@@ -4163,7 +4176,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 
 	session, err := backend.Execute(agentCtx, prompt, opts)
 	if err != nil {
-		taskLog.Debug("backend execute returned error", "error", err)
+		taskLog.Debug("backend execute returned error", "error_bytes", len(err.Error()))
 		return agent.Result{}, 0, err
 	}
 	taskLog.Debug("backend started, draining messages")
@@ -4308,7 +4321,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 				case agent.MessageToolUse:
 					n := toolCount.Add(1)
 					inFlightTools.Add(1)
-					taskLog.Info(fmt.Sprintf("tool #%d: %s", n, msg.Tool))
+					taskLog.Info("tool use observed",
+						"count", n,
+						"tool_name_bytes", len(msg.Tool),
+						"call_id_present", msg.CallID != "",
+					)
 					if msg.CallID != "" {
 						mu.Lock()
 						callIDToTool[msg.CallID] = msg.Tool
@@ -4349,7 +4366,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						toolName = callIDToTool[msg.CallID]
 						mu.Unlock()
 					}
-					taskLog.Info("tool_result observed", "seq", s, "tool", toolName, "call_id", msg.CallID)
+					taskLog.Info("tool result observed",
+						"seq", s,
+						"tool_name_bytes", len(toolName),
+						"call_id_present", msg.CallID != "",
+					)
 					mu.Lock()
 					batch = append(batch, TaskMessageData{
 						Seq:    int(s),
@@ -4366,13 +4387,13 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					}
 				case agent.MessageText:
 					if msg.Content != "" {
-						taskLog.Debug("agent", "text", truncateLog(msg.Content, 200))
+						taskLog.Debug("agent text observed", "content_bytes", len(msg.Content))
 						mu.Lock()
 						pendingText.WriteString(msg.Content)
 						mu.Unlock()
 					}
 				case agent.MessageError:
-					taskLog.Error("agent error", "content", msg.Content)
+					taskLog.Error("agent error observed", "content_bytes", len(msg.Content))
 					s := msgSeq.Add(1)
 					mu.Lock()
 					batch = append(batch, TaskMessageData{
@@ -4644,17 +4665,6 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:8]
-}
-
-// truncateLog truncates a string to maxLen, appending "…" if truncated.
-// Also collapses newlines to spaces for single-line log output.
-func truncateLog(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.TrimSpace(s)
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "…"
 }
 
 func convertSkillsForEnv(skills []SkillData) []execenv.SkillContextForEnv {
