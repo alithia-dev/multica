@@ -29,30 +29,25 @@ const openclawNoParseableOutput = "openclaw returned no parseable output"
 // of "openclaw returned no parseable output".
 const minOpenclawVersion = "2026.5.5"
 
-// openclawProgressCadence controls how often the adapter emits a safe,
-// synthetic phase checkpoint while waiting for OpenClaw's final JSON result.
-// OpenClaw currently exposes no live event stream for gateway-backed runs, so
-// these checkpoints describe the adapter's coarse execution window rather
-// than claiming that a particular tool call or data mutation occurred.
+// openclawProgressCadence controls when the adapter emits one truthful fallback
+// heartbeat while waiting for a final-only OpenClaw backend. Named phases are
+// emitted only when OpenClaw provides an explicit lifecycle event.
 const openclawProgressCadence = 30 * time.Second
 const openclawProgressDeliveryTimeout = 5 * time.Second
 
-// openclawProgressMessages are intentionally static. Never interpolate the
-// prompt, paths, tool data, subprocess output, or environment values here:
-// task messages are persisted and broadcast to operators while the run is
-// active. The write-phase wording is conditional because read-only tasks must
-// not appear to have changed data.
-var openclawProgressMessages = []string{
-	"Starting the requested run: inspect the assigned source/package, run preflight, apply only authorized writes, verify by readback/replay, then finalize.\n",
-	"Source/package opened.\n",
-	"Preflight complete.\n",
-	"Write/apply phase started where authorized.\n",
-	"Readback/replay phase started.\n",
-}
+// Progress messages are intentionally static. Never interpolate the prompt,
+// paths, tool data, subprocess output, or environment values here: task
+// messages are persisted and broadcast to operators while the run is active.
+const openclawStartedMessage = "Starting the requested run: GRIT will execute the assigned task and deliver its final result.\n"
+const openclawWaitingMessage = "OpenClaw is still running; no phase transition has been reported.\n"
+const openclawSourceOpenedMessage = "Source/package opened.\n"
+const openclawPreflightCompleteMessage = "Preflight complete.\n"
+const openclawWriteStartedMessage = "Write/apply phase started.\n"
+const openclawReadbackStartedMessage = "Readback/replay phase started.\n"
 
 const openclawFinalizingMessage = "Finalizing the requested run.\n"
-const openclawCompletedMessage = "Completed the requested source/package workflow and verification; the final result was delivered.\n"
-const openclawFailedMessage = "The requested source/package workflow finished with an error; the final result was preserved.\n"
+const openclawCompletedMessage = "GRIT finished the requested run successfully; the final result was delivered.\n"
+const openclawFailedMessage = "GRIT finished the requested run with an error; the final result was preserved.\n"
 
 // openclawVersionPattern extracts a three-segment dotted version from
 // arbitrary `openclaw --version` output (e.g. "openclaw 2026.5.5",
@@ -148,10 +143,10 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
-	trySend(msgCh, Message{Type: MessageText, Content: openclawProgressMessages[0]})
-	progressCtx, stopProgress := context.WithCancel(runCtx)
+	trySend(msgCh, Message{Type: MessageText, Content: openclawStartedMessage})
+	phaseCh := make(chan string, 16)
 	progressDone := make(chan struct{})
-	go b.streamSafeProgress(progressCtx, msgCh, progressDone, execPath, opts.Cwd, progressDelivery)
+	go b.streamSafeProgress(runCtx, msgCh, progressDone, phaseCh, execPath, opts.Cwd, progressDelivery)
 
 	// Close stdout when the context is cancelled so the scanner unblocks.
 	go func() {
@@ -165,8 +160,8 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		defer close(resCh)
 
 		startTime := time.Now()
-		stdoutBytes, readErr := io.ReadAll(stdout)
-		stopProgress()
+		stdoutBytes, readErr := readOpenclawOutput(runCtx, stdout, phaseCh)
+		close(phaseCh)
 		<-progressDone
 		if runCtx.Err() == nil {
 			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, openclawFinalizingMessage)
@@ -275,9 +270,9 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 }
 
 // streamSafeProgress keeps final-result-only OpenClaw runs observable without
-// exposing any subprocess data. Each named phase is emitted at most once;
-// cancellation stops the stream promptly and emits no further messages.
-func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}, execPath, cwd string, delivery *openclawProgressDelivery) {
+// inventing work. Named phases require explicit lifecycle evidence from the
+// subprocess. A silent backend receives one throttled, truthful heartbeat.
+func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}, phases <-chan string, execPath, cwd string, delivery *openclawProgressDelivery) {
 	defer close(done)
 
 	cadence := b.progressCadence
@@ -285,33 +280,85 @@ func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Mess
 		cadence = openclawProgressCadence
 	}
 
-	phase := 1
-	b.deliverSafeProgress(ctx, execPath, cwd, delivery, openclawProgressMessages[0])
-	emit := func(content string) bool {
-		select {
-		case ch <- Message{Type: MessageText, Content: content}:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	b.deliverSafeProgress(ctx, execPath, cwd, delivery, openclawStartedMessage)
+	seen := make(map[string]struct{})
+	waitingEmitted := false
 	ticker := time.NewTicker(cadence)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case content, ok := <-phases:
+			if !ok {
+				return
+			}
+			if _, duplicate := seen[content]; duplicate {
+				continue
+			}
+			seen[content] = struct{}{}
+			b.publishSafeProgress(ctx, ch, execPath, cwd, delivery, content)
 		case <-ticker.C:
-			if phase >= len(openclawProgressMessages) {
-				return
+			if waitingEmitted || len(seen) > 0 {
+				continue
 			}
-			content := openclawProgressMessages[phase]
-			phase++
-			if !emit(content) {
-				return
-			}
-			b.deliverSafeProgress(ctx, execPath, cwd, delivery, content)
+			waitingEmitted = true
+			b.publishSafeProgress(ctx, ch, execPath, cwd, delivery, openclawWaitingMessage)
 		}
+	}
+}
+
+// readOpenclawOutput preserves stdout byte-for-byte for the existing result
+// parser while recognizing only explicit, line-delimited lifecycle events.
+// Tool names, arguments, output, and free-form text never become progress.
+func readOpenclawOutput(ctx context.Context, r io.Reader, phases chan<- string) ([]byte, error) {
+	reader := bufio.NewReader(r)
+	var output bytes.Buffer
+	seen := make(map[string]struct{})
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			_, _ = output.Write(line)
+			if event, ok := tryParseOpenclawEvent(strings.TrimSpace(string(line))); ok {
+				if content := openclawLifecycleProgress(event); content != "" {
+					if _, duplicate := seen[content]; !duplicate {
+						seen[content] = struct{}{}
+						select {
+						case phases <- content:
+						case <-ctx.Done():
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return output.Bytes(), nil
+			}
+			return output.Bytes(), err
+		}
+	}
+}
+
+// openclawLifecycleProgress maps an explicit backend lifecycle phase to a
+// static, redaction-safe operator message. Unknown phases are ignored.
+func openclawLifecycleProgress(event openclawEvent) string {
+	if event.Type != "lifecycle" {
+		return ""
+	}
+	phase := strings.ToLower(strings.TrimSpace(event.Phase))
+	phase = strings.NewReplacer("-", "_", " ", "_").Replace(phase)
+	switch phase {
+	case "source_opened", "source_package_opened":
+		return openclawSourceOpenedMessage
+	case "preflight_complete":
+		return openclawPreflightCompleteMessage
+	case "write_started", "apply_started", "write_apply_started":
+		return openclawWriteStartedMessage
+	case "readback_started", "replay_started", "readback_replay_started":
+		return openclawReadbackStartedMessage
+	default:
+		return ""
 	}
 }
 
