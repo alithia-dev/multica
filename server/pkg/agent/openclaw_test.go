@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -1472,9 +1473,12 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":150}}'
 			t.Fatalf("progress leaked prompt or subprocess data: %q", msg.Content)
 		}
 	}
-	for _, want := range append(openclawProgressMessages, openclawFinalizingMessage, "final answer") {
+	for _, want := range append(openclawProgressMessages, openclawFinalizingMessage, "final answer", openclawCompletedMessage) {
 		if !containsOpenclawString(contents, want) {
 			t.Errorf("missing streamed message %q in %q", want, contents)
+		}
+		if countOpenclawString(contents, want) != 1 {
+			t.Errorf("message %q was not deduplicated in %q", want, contents)
 		}
 	}
 }
@@ -1486,9 +1490,9 @@ func TestOpenclawProgressUsesOnlyRedactionSafeConstants(t *testing.T) {
 	ch := make(chan Message, 32)
 	done := make(chan struct{})
 	b := &openclawBackend{progressCadence: time.Millisecond}
-	go b.streamSafeProgress(ctx, ch, done)
+	go b.streamSafeProgress(ctx, ch, done, "", "", nil)
 
-	for range openclawProgressMessages {
+	for range openclawProgressMessages[1:] {
 		msg := <-ch
 		for _, forbidden := range []string{"token", "credential", "transaction", "prompt", "tool", "/home/", `c:\\`} {
 			if strings.Contains(strings.ToLower(msg.Content), forbidden) {
@@ -1529,10 +1533,182 @@ printf '%s\n' '{"payloads":[{"text":"legacy final"}],"meta":{"durationMs":1}}'
 	if result.Status != "completed" || result.Output != "legacy final" {
 		t.Fatalf("result = %+v, want completed legacy final", result)
 	}
-	for _, want := range []string{openclawProgressMessages[0], openclawFinalizingMessage, "legacy final"} {
+	for _, want := range []string{openclawProgressMessages[0], openclawFinalizingMessage, "legacy final", openclawCompletedMessage} {
 		if !containsOpenclawString(contents, want) {
 			t.Errorf("missing message %q in %q", want, contents)
 		}
+	}
+}
+
+func TestOpenclawProgressMirrorsToDiscord(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "openclaw")
+	deliveryLog := filepath.Join(dir, "delivery.log")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+if [ "$1" = "message" ]; then
+  printf '%s\n' "$*" >> "$DELIVERY_LOG"
+  exit 0
+fi
+sleep 0.08
+printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":80}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{
+		cfg: Config{
+			ExecutablePath: fakePath,
+			Env:            map[string]string{"DELIVERY_LOG": deliveryLog},
+			Logger:         slog.Default(),
+		},
+		progressCadence: 10 * time.Millisecond,
+	}
+	session, err := b.Execute(context.Background(), "sensitive prompt", ExecOptions{
+		CustomArgs: []string{"--channel", "discord", "--to", "channel:123", "--deliver"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var multicaMessages []string
+	for msg := range session.Messages {
+		multicaMessages = append(multicaMessages, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "final answer" {
+		t.Fatalf("result = %+v", result)
+	}
+
+	deliveredBytes, err := os.ReadFile(deliveryLog)
+	if err != nil {
+		t.Fatalf("read delivery log: %v", err)
+	}
+	delivered := string(deliveredBytes)
+	for _, want := range append(openclawProgressMessages, openclawFinalizingMessage, openclawCompletedMessage) {
+		if !containsOpenclawString(multicaMessages, want) {
+			t.Errorf("Multica surface missing %q", want)
+		}
+		if strings.Count(delivered, want) != 1 {
+			t.Errorf("Discord surface count for %q = %d, want 1; log=%q", want, strings.Count(delivered, want), delivered)
+		}
+	}
+	for _, forbidden := range []string{"sensitive prompt", "token=", "transaction="} {
+		if strings.Contains(delivered, forbidden) {
+			t.Fatalf("Discord progress leaked sensitive data %q: %q", forbidden, delivered)
+		}
+	}
+}
+
+func TestOpenclawDiscordFailureDoesNotSuppressMulticaOrFinalResult(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+if [ "$1" = "message" ]; then
+  exit 42
+fi
+sleep 0.03
+printf '%s\n' '{"payloads":[{"text":"final survives"}],"meta":{"durationMs":30}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{
+		cfg:             Config{ExecutablePath: fakePath, Logger: slog.Default()},
+		progressCadence: 5 * time.Millisecond,
+	}
+	session, err := b.Execute(context.Background(), "prompt", ExecOptions{
+		CustomArgs: []string{"--channel=discord", "--to=channel:123", "--deliver"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var messages []string
+	for msg := range session.Messages {
+		messages = append(messages, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "final survives" {
+		t.Fatalf("Discord failure changed final result: %+v", result)
+	}
+	for _, want := range []string{openclawProgressMessages[0], openclawFinalizingMessage, "final survives", openclawCompletedMessage} {
+		if !containsOpenclawString(messages, want) {
+			t.Errorf("Multica surface missing %q after Discord failure: %q", want, messages)
+		}
+	}
+}
+
+func TestOpenclawMulticaBackpressureDoesNotSuppressDiscord(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "openclaw")
+	deliveryLog := filepath.Join(dir, "delivery.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$DELIVERY_LOG"
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{cfg: Config{
+		Env:    map[string]string{"DELIVERY_LOG": deliveryLog},
+		Logger: slog.Default(),
+	}}
+	ch := make(chan Message, 1)
+	ch <- Message{Type: MessageText, Content: "occupy Multica buffer"}
+	b.publishSafeProgress(context.Background(), ch, fakePath, "", &openclawProgressDelivery{
+		channel: "discord",
+		target:  "channel:123",
+	}, openclawProgressMessages[0])
+
+	if got := (<-ch).Content; got != "occupy Multica buffer" {
+		t.Fatalf("full Multica buffer unexpectedly changed: %q", got)
+	}
+	deliveredBytes, err := os.ReadFile(deliveryLog)
+	if err != nil {
+		t.Fatalf("read delivery log: %v", err)
+	}
+	if !strings.Contains(string(deliveredBytes), openclawProgressMessages[0]) {
+		t.Fatalf("Discord delivery was suppressed by Multica backpressure: %q", deliveredBytes)
+	}
+}
+
+func TestParseOpenclawProgressDelivery(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want *openclawProgressDelivery
+	}{
+		{name: "discord target", args: []string{"agent", "--channel", "discord", "--to", "123", "--deliver"}, want: &openclawProgressDelivery{channel: "discord", target: "123"}},
+		{name: "equals and overrides", args: []string{"agent", "--channel=slack", "--to=old", "--reply-channel=discord", "--reply-to=channel:456", "--reply-account=grit", "--deliver"}, want: &openclawProgressDelivery{channel: "discord", target: "channel:456", account: "grit"}},
+		{name: "no deliver", args: []string{"agent", "--channel", "discord", "--to", "123"}},
+		{name: "non-discord", args: []string{"agent", "--channel", "slack", "--to", "123", "--deliver"}},
+		{name: "prompt cannot inject route", args: []string{"agent", "--message", "--channel discord --to 123 --deliver"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseOpenclawProgressDelivery(tt.args)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1586,6 +1762,16 @@ func containsOpenclawString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func countOpenclawString(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
 }
 
 // ── Version gate tests (MUL-1803) ──
