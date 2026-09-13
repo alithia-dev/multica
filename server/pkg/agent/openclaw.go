@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,29 @@ const minOpenclawVersion = "2026.5.5"
 // emitted only when OpenClaw provides an explicit lifecycle event.
 const openclawProgressCadence = 30 * time.Second
 const openclawProgressDeliveryTimeout = 5 * time.Second
+
+// redactedSubprocessLogWriter preserves the fact that stderr was produced but
+// never persists subprocess-controlled content. OpenClaw output may contain
+// prompts, tool output, financial rows, balances, or credentials.
+type redactedSubprocessLogWriter struct {
+	logger *slog.Logger
+	prefix string
+	once   sync.Once
+}
+
+func newRedactedSubprocessLogWriter(logger *slog.Logger, prefix string) *redactedSubprocessLogWriter {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &redactedSubprocessLogWriter{logger: logger, prefix: prefix}
+}
+
+func (w *redactedSubprocessLogWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		w.logger.Debug(w.prefix + "output suppressed")
+	})
+	return len(p), nil
+}
 
 // Progress messages are intentionally static. Never interpolate the prompt,
 // paths, tool data, subprocess output, or environment values here: task
@@ -123,16 +147,15 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	cmd.Env = buildEnv(b.cfg.Env)
 
-	// openclaw writes its --json output to stdout. Stderr carries log
-	// overflow (security warnings, tool errors, etc.) — capture it via a
-	// log writer so it surfaces in daemon logs without being fed into the
-	// JSON parser.
+	// openclaw writes its --json output to stdout. Stderr can carry prompts,
+	// tool output, or secrets, so preserve only the fact that output occurred;
+	// never feed subprocess-controlled content into daemon logs or the parser.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("openclaw stdout pipe: %w", err)
 	}
-	cmd.Stderr = newLogWriter(b.cfg.Logger, "[openclaw:stderr] ")
+	cmd.Stderr = newRedactedSubprocessLogWriter(b.cfg.Logger, "[openclaw:stderr] ")
 
 	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		cancel()
@@ -707,7 +730,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				})
 			case "error":
 				errMsg := event.errorMessage()
-				b.cfg.Logger.Warn("openclaw error event", "error", errMsg)
+				b.cfg.Logger.Warn("openclaw error event")
 				trySend(ch, Message{Type: MessageError, Content: errMsg})
 				finalStatus = "failed"
 				finalError = errMsg
@@ -715,7 +738,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 				phase := event.Phase
 				if phase == "error" || phase == "failed" || phase == "cancelled" {
 					errMsg := event.errorMessage()
-					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase, "error", errMsg)
+					b.cfg.Logger.Warn("openclaw lifecycle failure", "phase", phase)
 					trySend(ch, Message{Type: MessageError, Content: errMsg})
 					finalStatus = "failed"
 					finalError = errMsg

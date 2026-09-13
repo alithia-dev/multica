@@ -2666,7 +2666,7 @@ printf '%s\n' '{"type":"lifecycle","phase":"failed","message":"environment-senti
 		t.Fatalf("new OpenClaw backend: %v", err)
 	}
 	d, rec := newTranscriptRecorder(t)
-	result, _, err := d.executeAndDrain(context.Background(), backend, "task", agent.ExecOptions{}, taskLog, "task-log-redaction", new(atomic.Int32))
+	result, _, err := d.executeAndDrain(context.Background(), backend, "task", agent.ExecOptions{}, taskLog, "task-log-redaction", "", new(atomic.Int32))
 	if err != nil {
 		t.Fatalf("executeAndDrain: %v", err)
 	}
