@@ -35,6 +35,7 @@ const minOpenclawVersion = "2026.5.5"
 // these checkpoints describe the adapter's coarse execution window rather
 // than claiming that a particular tool call or data mutation occurred.
 const openclawProgressCadence = 30 * time.Second
+const openclawProgressDeliveryTimeout = 5 * time.Second
 
 // openclawProgressMessages are intentionally static. Never interpolate the
 // prompt, paths, tool data, subprocess output, or environment values here:
@@ -42,15 +43,16 @@ const openclawProgressCadence = 30 * time.Second
 // active. The write-phase wording is conditional because read-only tasks must
 // not appear to have changed data.
 var openclawProgressMessages = []string{
-	"OpenClaw run started",
-	"OpenClaw run active — source/package inspection",
-	"OpenClaw run active — preflight checks",
-	"OpenClaw run active — write/apply phase when authorized",
-	"OpenClaw run active — readback/replay verification",
+	"Starting the requested run: inspect the assigned source/package, run preflight, apply only authorized writes, verify by readback/replay, then finalize.\n",
+	"Source/package opened.\n",
+	"Preflight complete.\n",
+	"Write/apply phase started where authorized.\n",
+	"Readback/replay phase started.\n",
 }
 
-const openclawFinalizingMessage = "OpenClaw run finalizing"
-const openclawStillActiveMessage = "OpenClaw run active — awaiting completion"
+const openclawFinalizingMessage = "Finalizing the requested run.\n"
+const openclawCompletedMessage = "Completed the requested source/package workflow and verification; the final result was delivered.\n"
+const openclawFailedMessage = "The requested source/package workflow finished with an error; the final result was preserved.\n"
 
 // openclawVersionPattern extracts a three-segment dotted version from
 // arbitrary `openclaw --version` output (e.g. "openclaw 2026.5.5",
@@ -99,6 +101,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		sessionID = fmt.Sprintf("multica-%d", time.Now().UnixNano())
 	}
 	args := buildOpenclawArgs(prompt, sessionID, opts, b.cfg.Logger)
+	progressDelivery := parseOpenclawProgressDelivery(args)
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
@@ -132,7 +135,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	trySend(msgCh, Message{Type: MessageText, Content: openclawProgressMessages[0]})
 	progressCtx, stopProgress := context.WithCancel(runCtx)
 	progressDone := make(chan struct{})
-	go b.streamSafeProgress(progressCtx, msgCh, progressDone)
+	go b.streamSafeProgress(progressCtx, msgCh, progressDone, execPath, opts.Cwd, progressDelivery)
 
 	// Close stdout when the context is cancelled so the scanner unblocks.
 	go func() {
@@ -150,7 +153,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		stopProgress()
 		<-progressDone
 		if runCtx.Err() == nil {
-			trySend(msgCh, Message{Type: MessageText, Content: openclawFinalizingMessage})
+			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, openclawFinalizingMessage)
 		}
 		var scanResult openclawEventResult
 		if readErr != nil {
@@ -175,6 +178,13 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		}
 
 		b.cfg.Logger.Info("openclaw finished", "pid", cmd.Process.Pid, "status", scanResult.status, "duration", duration.Round(time.Millisecond).String())
+		if runCtx.Err() == nil {
+			completion := openclawCompletedMessage
+			if scanResult.status != "completed" {
+				completion = openclawFailedMessage
+			}
+			b.publishSafeProgress(runCtx, msgCh, execPath, opts.Cwd, progressDelivery, completion)
+		}
 
 		// Build usage map. Prefer the model openclaw reported in
 		// `meta.agentMeta.model` (the actual LLM, e.g. `deepseek-chat`).
@@ -209,10 +219,9 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 }
 
 // streamSafeProgress keeps final-result-only OpenClaw runs observable without
-// exposing any subprocess data. Once the named phase checkpoints are exhausted
-// it emits a periodic liveness checkpoint so long financial runs do not look
-// hung. Cancellation stops the stream promptly and emits no further messages.
-func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}) {
+// exposing any subprocess data. Each named phase is emitted at most once;
+// cancellation stops the stream promptly and emits no further messages.
+func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Message, done chan<- struct{}, execPath, cwd string, delivery *openclawProgressDelivery) {
 	defer close(done)
 
 	cadence := b.progressCadence
@@ -221,6 +230,7 @@ func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Mess
 	}
 
 	phase := 1
+	b.deliverSafeProgress(ctx, execPath, cwd, delivery, openclawProgressMessages[0])
 	emit := func(content string) bool {
 		select {
 		case ch <- Message{Type: MessageText, Content: content}:
@@ -236,15 +246,99 @@ func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Mess
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			content := openclawStillActiveMessage
-			if phase < len(openclawProgressMessages) {
-				content = openclawProgressMessages[phase]
-				phase++
+			if phase >= len(openclawProgressMessages) {
+				return
 			}
+			content := openclawProgressMessages[phase]
+			phase++
 			if !emit(content) {
 				return
 			}
+			b.deliverSafeProgress(ctx, execPath, cwd, delivery, content)
 		}
+	}
+}
+
+// openclawProgressDelivery is derived only from explicit OpenClaw delivery
+// flags. A nil route means the run has no originating Discord surface and
+// progress remains Multica-only.
+type openclawProgressDelivery struct {
+	channel string
+	target  string
+	account string
+}
+
+// parseOpenclawProgressDelivery extracts the same explicit Discord destination
+// used by the primary `openclaw agent --deliver` invocation. It stops at
+// --message so prompt text can never be interpreted as routing flags.
+func parseOpenclawProgressDelivery(args []string) *openclawProgressDelivery {
+	values := make(map[string]string)
+	deliver := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--message" || strings.HasPrefix(arg, "--message=") {
+			break
+		}
+		if arg == "--deliver" {
+			deliver = true
+			continue
+		}
+		for _, flag := range []string{"--channel", "--reply-channel", "--to", "--reply-to", "--reply-account"} {
+			if arg == flag && i+1 < len(args) {
+				i++
+				values[flag] = args[i]
+				break
+			}
+			if strings.HasPrefix(arg, flag+"=") {
+				values[flag] = strings.TrimPrefix(arg, flag+"=")
+				break
+			}
+		}
+	}
+	channel := values["--reply-channel"]
+	if channel == "" {
+		channel = values["--channel"]
+	}
+	target := values["--reply-to"]
+	if target == "" {
+		target = values["--to"]
+	}
+	if !deliver || !strings.EqualFold(channel, "discord") || strings.TrimSpace(target) == "" {
+		return nil
+	}
+	return &openclawProgressDelivery{
+		channel: "discord",
+		target:  target,
+		account: values["--reply-account"],
+	}
+}
+
+func (b *openclawBackend) publishSafeProgress(ctx context.Context, ch chan<- Message, execPath, cwd string, delivery *openclawProgressDelivery, content string) {
+	trySend(ch, Message{Type: MessageText, Content: content})
+	b.deliverSafeProgress(ctx, execPath, cwd, delivery, content)
+}
+
+// deliverSafeProgress mirrors an allowlisted checkpoint to Discord. Delivery
+// is best-effort and independently bounded: an unavailable Discord surface
+// must never suppress Multica progress or alter the agent's final result.
+func (b *openclawBackend) deliverSafeProgress(ctx context.Context, execPath, cwd string, delivery *openclawProgressDelivery, content string) {
+	if delivery == nil {
+		return
+	}
+	deliveryCtx, cancel := context.WithTimeout(ctx, openclawProgressDeliveryTimeout)
+	defer cancel()
+	args := []string{"message", "send", "--channel", delivery.channel, "--target", delivery.target, "--message", content, "--silent"}
+	if delivery.account != "" {
+		args = append(args, "--account", delivery.account)
+	}
+	cmd := exec.CommandContext(deliveryCtx, execPath, args...)
+	hideAgentWindow(cmd)
+	cmd.Dir = cwd
+	cmd.Env = buildEnv(b.cfg.Env)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		b.cfg.Logger.Warn("openclaw progress delivery failed", "channel", delivery.channel, "error", err)
 	}
 }
 
