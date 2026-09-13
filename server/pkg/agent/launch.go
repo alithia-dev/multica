@@ -24,6 +24,7 @@ const maxLoggedAgentCommandFlagLen = 64
 type agentCommandLogArgs struct {
 	invocationArgs     []string
 	trustedPositionals []trustedAgentCommandPositional
+	redactedValues     []trustedAgentCommandPositional
 }
 
 type trustedAgentCommandPositional struct {
@@ -40,6 +41,29 @@ func newAgentCommandLogArgs(invocationArgs []string, trustedPositionals ...trust
 		invocationArgs:     invocationArgs,
 		trustedPositionals: append([]trustedAgentCommandPositional(nil), trustedPositionals...),
 	}
+}
+
+// withRedactedValuesAfter marks source-proven value positions that must remain
+// redacted even when their contents are syntactically indistinguishable from a
+// flag (for example, an API token beginning with "--"). The flag schema comes
+// from the adapter that assembled argv; the launch boundary verifies both the
+// index and value against the final command before applying it.
+func (a agentCommandLogArgs) withRedactedValuesAfter(valueFlags ...string) agentCommandLogArgs {
+	flags := make(map[string]struct{}, len(valueFlags))
+	for _, flag := range valueFlags {
+		flags[flag] = struct{}{}
+	}
+	for i := 0; i+1 < len(a.invocationArgs); i++ {
+		if _, ok := flags[a.invocationArgs[i]]; !ok {
+			continue
+		}
+		i++
+		a.redactedValues = append(a.redactedValues, trustedAgentCommandPositional{
+			index: i,
+			value: a.invocationArgs[i],
+		})
+	}
+	return a
 }
 
 // Command is the identity of a runtime CLI: the executable Multica spawns plus
@@ -344,10 +368,14 @@ func (c Config) logAgentCommandFields(cmd *exec.Cmd, source agentCommandLogArgs,
 		args = cmd.Args[1:]
 	}
 	trustedPositionals := c.trustedAgentCommandPositionals(args, source)
+	redactedArgs := redactAgentCommandArgs(args, trustedPositionals)
+	for index := range c.redactedAgentCommandValues(args, source) {
+		redactedArgs[index] = redactedAgentCommandArg
+	}
 	fields := []any{
 		"provider", c.provider,
 		"exec", cmd.Path,
-		"args", redactAgentCommandArgs(args, trustedPositionals),
+		"args", redactedArgs,
 		"arg_count", len(args),
 	}
 	if includePromptBytes {
@@ -361,21 +389,9 @@ func (c Config) logAgentCommandFields(cmd *exec.Cmd, source agentCommandLogArgs,
 // arguments, so the original launch prefix plus adapter argv must match the
 // final suffix before any positional is trusted. A mismatch fails closed.
 func (c Config) trustedAgentCommandPositionals(finalArgs []string, source agentCommandLogArgs) map[int]struct{} {
-	originalLen := len(c.LaunchPrefix) + len(source.invocationArgs)
-	start := len(finalArgs) - originalLen
-	if start < 0 {
+	invocationStart, ok := c.agentCommandInvocationStart(finalArgs, source)
+	if !ok {
 		return nil
-	}
-	for i, arg := range c.LaunchPrefix {
-		if finalArgs[start+i] != arg {
-			return nil
-		}
-	}
-	invocationStart := start + len(c.LaunchPrefix)
-	for i, arg := range source.invocationArgs {
-		if finalArgs[invocationStart+i] != arg {
-			return nil
-		}
 	}
 
 	trusted := make(map[int]struct{}, len(source.trustedPositionals))
@@ -387,6 +403,43 @@ func (c Config) trustedAgentCommandPositionals(finalArgs []string, source agentC
 		trusted[invocationStart+positional.index] = struct{}{}
 	}
 	return trusted
+}
+
+func (c Config) redactedAgentCommandValues(finalArgs []string, source agentCommandLogArgs) map[int]struct{} {
+	invocationStart, ok := c.agentCommandInvocationStart(finalArgs, source)
+	if !ok {
+		return nil
+	}
+
+	redacted := make(map[int]struct{}, len(source.redactedValues))
+	for _, value := range source.redactedValues {
+		if value.index < 0 || value.index >= len(source.invocationArgs) ||
+			source.invocationArgs[value.index] != value.value {
+			continue
+		}
+		redacted[invocationStart+value.index] = struct{}{}
+	}
+	return redacted
+}
+
+func (c Config) agentCommandInvocationStart(finalArgs []string, source agentCommandLogArgs) (int, bool) {
+	originalLen := len(c.LaunchPrefix) + len(source.invocationArgs)
+	start := len(finalArgs) - originalLen
+	if start < 0 {
+		return 0, false
+	}
+	for i, arg := range c.LaunchPrefix {
+		if finalArgs[start+i] != arg {
+			return 0, false
+		}
+	}
+	invocationStart := start + len(c.LaunchPrefix)
+	for i, arg := range source.invocationArgs {
+		if finalArgs[invocationStart+i] != arg {
+			return 0, false
+		}
+	}
+	return invocationStart, true
 }
 
 // redactAgentCommandArgs preserves only syntactically plausible flag names and

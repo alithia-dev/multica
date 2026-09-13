@@ -142,6 +142,17 @@ var openclawBlockedArgs = map[string]blockedArgMode{
 	"--system-prompt": blockedWithValue,  // openclaw agent does not accept --system-prompt; instructions are injected into --message
 }
 
+// openclawCommandLogValueFlags identifies argv positions whose values are
+// always sensitive, including route/account metadata and credential-shaped
+// custom arguments. Source-position marking prevents a value beginning with
+// "-" or "--" from being mistaken for a safe flag name in command logs.
+var openclawCommandLogValueFlags = []string{
+	"--session-id", "--timeout", "--agent", "--message",
+	"--channel", "--reply-channel", "--to", "--reply-to",
+	"--account", "--reply-account",
+	"--api-key", "--token", "--auth-token",
+}
+
 // openclawBackend implements Backend by spawning `openclaw agent --message <prompt>
 // --output-format stream-json --yes` and reading streaming NDJSON events from
 // stdout — similar to the opencode backend.
@@ -178,7 +189,9 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
-	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args, trustAgentCommandPositional(0, "agent")))
+	commandLogArgs := newAgentCommandLogArgs(args, trustAgentCommandPositional(0, "agent"))
+	commandLogArgs = commandLogArgs.withRedactedValuesAfter(openclawCommandLogValueFlags...)
+	b.cfg.logAgentCommand(cmd, commandLogArgs)
 	// 500ms, matching cursor-agent — the other backend whose CLI can deliver a
 	// terminal result while keeping a process alive.
 	//
@@ -358,6 +371,7 @@ func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Mess
 		cadence = openclawProgressCadence
 	}
 
+	startedAt := time.Now()
 	b.deliverSafeProgress(ctx, execPath, cwd, delivery, startedMessage)
 	seen := make(map[string]struct{})
 	waitingEmitted := false
@@ -369,6 +383,13 @@ func (b *openclawBackend) streamSafeProgress(ctx context.Context, ch chan<- Mess
 			return
 		case content, ok := <-phases:
 			if !ok {
+				// A busy package can delay this goroutine until both the cadence
+				// timer and stream completion are ready. select may choose the
+				// closed stream first, so preserve the heartbeat owed for the
+				// elapsed silent interval before finalization begins.
+				if ctx.Err() == nil && !waitingEmitted && len(seen) == 0 && time.Since(startedAt) >= cadence {
+					b.publishSafeProgress(ctx, ch, execPath, cwd, delivery, openclawWaitingMessage)
+				}
 				return
 			}
 			if _, duplicate := seen[content]; duplicate {
