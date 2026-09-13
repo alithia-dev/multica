@@ -1438,9 +1438,14 @@ if [ "$1" = "--version" ]; then
   echo 'openclaw 2026.5.5'
   exit 0
 fi
-sleep 0.15
+printf '%s\n' '{"type":"lifecycle","phase":"source_opened"}'
+printf '%s\n' '{"type":"lifecycle","phase":"preflight_complete"}'
+printf '%s\n' '{"type":"lifecycle","phase":"preflight_complete"}'
+printf '%s\n' '{"type":"lifecycle","phase":"write_started"}'
+printf '%s\n' '{"type":"lifecycle","phase":"readback_started"}'
+sleep 0.05
 echo 'token=super-secret transaction=private-row' >&2
-printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":150}}'
+printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":50}}'
 `
 	writeTestExecutable(t, fakePath, []byte(script))
 
@@ -1457,8 +1462,8 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":150}}'
 	select {
 	case msg := <-session.Messages:
 		first = msg
-		if msg.Content != openclawProgressMessages[0] {
-			t.Fatalf("first message = %q, want %q", msg.Content, openclawProgressMessages[0])
+		if msg.Content != openclawStartedMessage {
+			t.Fatalf("first message = %q, want %q", msg.Content, openclawStartedMessage)
 		}
 	case result := <-session.Result:
 		t.Fatalf("result arrived before progress: %+v", result)
@@ -1484,7 +1489,16 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":150}}'
 			t.Fatalf("progress leaked prompt or subprocess data: %q", msg.Content)
 		}
 	}
-	for _, want := range append(openclawProgressMessages, openclawFinalizingMessage, "final answer", openclawCompletedMessage) {
+	for _, want := range []string{
+		openclawStartedMessage,
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+		openclawFinalizingMessage,
+		"final answer",
+		openclawCompletedMessage,
+	} {
 		if !containsOpenclawString(contents, want) {
 			t.Errorf("missing streamed message %q in %q", want, contents)
 		}
@@ -1494,25 +1508,98 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":150}}'
 	}
 }
 
+func TestOpenclawSilentBackendDoesNotInventPhases(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'openclaw 2026.5.5'
+  exit 0
+fi
+sleep 0.06
+printf '%s\n' '{"payloads":[{"text":"no-op final"}],"meta":{"durationMs":60}}'
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	b := &openclawBackend{
+		cfg:             Config{ExecutablePath: fakePath, Logger: slog.Default()},
+		progressCadence: 10 * time.Millisecond,
+	}
+	session, err := b.Execute(context.Background(), "research only", ExecOptions{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	var contents []string
+	for msg := range session.Messages {
+		contents = append(contents, msg.Content)
+	}
+	result := <-session.Result
+	if result.Status != "completed" || result.Output != "no-op final" {
+		t.Fatalf("result = %+v, want completed no-op final", result)
+	}
+	if !containsOpenclawString(contents, openclawWaitingMessage) {
+		t.Fatalf("silent backend missing truthful heartbeat: %q", contents)
+	}
+	for _, falseClaim := range []string{
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+	} {
+		if containsOpenclawString(contents, falseClaim) {
+			t.Errorf("silent backend invented phase %q in %q", falseClaim, contents)
+		}
+	}
+}
+
+func TestOpenclawLifecycleProgressRequiresExplicitAllowlistedEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		event openclawEvent
+		want  string
+	}{
+		{event: openclawEvent{Type: "lifecycle", Phase: "source_opened"}, want: openclawSourceOpenedMessage},
+		{event: openclawEvent{Type: "lifecycle", Phase: "preflight-complete"}, want: openclawPreflightCompleteMessage},
+		{event: openclawEvent{Type: "lifecycle", Phase: "write started"}, want: openclawWriteStartedMessage},
+		{event: openclawEvent{Type: "lifecycle", Phase: "readback_replay_started"}, want: openclawReadbackStartedMessage},
+		{event: openclawEvent{Type: "tool_use", Phase: "write_started"}},
+		{event: openclawEvent{Type: "lifecycle", Phase: "verification_complete"}},
+		{event: openclawEvent{Type: "text", Text: "preflight complete"}},
+	}
+	for _, tt := range tests {
+		if got := openclawLifecycleProgress(tt.event); got != tt.want {
+			t.Errorf("openclawLifecycleProgress(%+v) = %q, want %q", tt.event, got, tt.want)
+		}
+	}
+}
+
 func TestOpenclawProgressUsesOnlyRedactionSafeConstants(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan Message, 32)
-	done := make(chan struct{})
-	b := &openclawBackend{progressCadence: time.Millisecond}
-	go b.streamSafeProgress(ctx, ch, done, "", "", nil)
-
-	for range openclawProgressMessages[1:] {
-		msg := <-ch
+	messages := []string{
+		openclawStartedMessage,
+		openclawWaitingMessage,
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+		openclawFinalizingMessage,
+		openclawCompletedMessage,
+		openclawFailedMessage,
+	}
+	for _, message := range messages {
 		for _, forbidden := range []string{"token", "credential", "transaction", "prompt", "tool", "/home/", `c:\\`} {
-			if strings.Contains(strings.ToLower(msg.Content), forbidden) {
-				t.Fatalf("progress %q contains forbidden data-shaped text %q", msg.Content, forbidden)
+			if strings.Contains(strings.ToLower(message), forbidden) {
+				t.Fatalf("progress %q contains forbidden data-shaped text %q", message, forbidden)
 			}
 		}
 	}
-	cancel()
-	<-done
 }
 
 func TestOpenclawExecuteFinalOnlyBackendCompatibility(t *testing.T) {
@@ -1544,9 +1631,19 @@ printf '%s\n' '{"payloads":[{"text":"legacy final"}],"meta":{"durationMs":1}}'
 	if result.Status != "completed" || result.Output != "legacy final" {
 		t.Fatalf("result = %+v, want completed legacy final", result)
 	}
-	for _, want := range []string{openclawProgressMessages[0], openclawFinalizingMessage, "legacy final", openclawCompletedMessage} {
+	for _, want := range []string{openclawStartedMessage, openclawFinalizingMessage, "legacy final", openclawCompletedMessage} {
 		if !containsOpenclawString(contents, want) {
 			t.Errorf("missing message %q in %q", want, contents)
+		}
+	}
+	for _, falseClaim := range []string{
+		openclawSourceOpenedMessage,
+		openclawPreflightCompleteMessage,
+		openclawWriteStartedMessage,
+		openclawReadbackStartedMessage,
+	} {
+		if containsOpenclawString(contents, falseClaim) {
+			t.Errorf("final-only backend invented phase %q in %q", falseClaim, contents)
 		}
 	}
 }
@@ -1602,7 +1699,7 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":80}}'
 		t.Fatalf("read delivery log: %v", err)
 	}
 	delivered := string(deliveredBytes)
-	for _, want := range append(openclawProgressMessages, openclawFinalizingMessage, openclawCompletedMessage) {
+	for _, want := range []string{openclawStartedMessage, openclawWaitingMessage, openclawFinalizingMessage, openclawCompletedMessage} {
 		if !containsOpenclawString(multicaMessages, want) {
 			t.Errorf("Multica surface missing %q", want)
 		}
@@ -1655,7 +1752,7 @@ printf '%s\n' '{"payloads":[{"text":"final survives"}],"meta":{"durationMs":30}}
 	if result.Status != "completed" || result.Output != "final survives" {
 		t.Fatalf("Discord failure changed final result: %+v", result)
 	}
-	for _, want := range []string{openclawProgressMessages[0], openclawFinalizingMessage, "final survives", openclawCompletedMessage} {
+	for _, want := range []string{openclawStartedMessage, openclawFinalizingMessage, "final survives", openclawCompletedMessage} {
 		if !containsOpenclawString(messages, want) {
 			t.Errorf("Multica surface missing %q after Discord failure: %q", want, messages)
 		}
@@ -1685,7 +1782,7 @@ printf '%s\n' "$*" >> "$DELIVERY_LOG"
 	b.publishSafeProgress(context.Background(), ch, fakePath, "", &openclawProgressDelivery{
 		channel: "discord",
 		target:  "channel:123",
-	}, openclawProgressMessages[0])
+	}, openclawStartedMessage)
 
 	if got := (<-ch).Content; got != "occupy Multica buffer" {
 		t.Fatalf("full Multica buffer unexpectedly changed: %q", got)
@@ -1694,7 +1791,7 @@ printf '%s\n' "$*" >> "$DELIVERY_LOG"
 	if err != nil {
 		t.Fatalf("read delivery log: %v", err)
 	}
-	if !strings.Contains(string(deliveredBytes), openclawProgressMessages[0]) {
+	if !strings.Contains(string(deliveredBytes), openclawStartedMessage) {
 		t.Fatalf("Discord delivery was suppressed by Multica backpressure: %q", deliveredBytes)
 	}
 }
@@ -1748,7 +1845,7 @@ exec sleep 10
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if msg := <-session.Messages; msg.Content != openclawProgressMessages[0] {
+	if msg := <-session.Messages; msg.Content != openclawStartedMessage {
 		t.Fatalf("first message = %q", msg.Content)
 	}
 	cancel()
@@ -1926,7 +2023,7 @@ func TestOpenclawExecuteAllowsCurrentVersion(t *testing.T) {
 		if result.Status != "failed" || result.Error != openclawNoParseableOutput {
 			t.Errorf("silent backend result = %+v, want canonical no-output failure", result)
 		}
-		if len(messages) == 0 || messages[0].Content != openclawProgressMessages[0] {
+		if len(messages) == 0 || messages[0].Content != openclawStartedMessage {
 			t.Errorf("silent backend did not emit safe startup progress: %+v", messages)
 		}
 	case <-time.After(10 * time.Second):
