@@ -1104,7 +1104,7 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":1}}'
 		CustomArgs: []string{
 			"--channel", "--private-channel",
 			"--reply-to", "--private-target",
-			"--reply-account", "-a",
+			"--reply-account", "--private-account-value",
 			"--api-key", "--private-token",
 		},
 	})
@@ -1120,7 +1120,7 @@ printf '%s\n' '{"payloads":[{"text":"final answer"}],"meta":{"durationMs":1}}'
 	output := logs.String()
 	for _, secret := range []string{
 		"--private-balance", "--private-system-prompt", "--private-channel",
-		"--private-target", "-a", "--private-token", "row-secret",
+		"--private-target", "--private-account-value", "--private-token", "row-secret",
 		"balance-secret", "stderr-token", "environment-secret",
 	} {
 		if strings.Contains(output, secret) {
