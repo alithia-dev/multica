@@ -153,6 +153,30 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				return
 			}
 
+			// Workspace-scoped service-account credential. The creating user's ID
+			// is retained solely for existing membership/role authorization; write
+			// attribution uses the separately stamped service principal.
+			if strings.HasPrefix(tokenString, "msa_") {
+				if queries == nil {
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+				st, err := queries.GetServiceAccountTokenByHash(r.Context(), auth.HashToken(tokenString))
+				if err != nil {
+					slog.Warn("auth: invalid service account token", "path", r.URL.Path, "error", err)
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+				r.Header.Set("X-User-ID", uuidToString(st.ServiceAccountID))
+				r.Header.Set("X-Service-Account-ID", uuidToString(st.ServiceAccountID))
+				r.Header.Set("X-Service-Account-Role", st.Role)
+				r.Header.Set("X-Workspace-ID", uuidToString(st.WorkspaceID))
+				r.Header.Set("X-Actor-Source", "service_account")
+				go queries.UpdateServiceAccountTokenLastUsed(context.Background(), st.ID)
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			// PAT: tokens starting with "mul_"
 			if strings.HasPrefix(tokenString, "mul_") {
 				hash := auth.HashToken(tokenString)

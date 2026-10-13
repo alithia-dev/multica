@@ -431,12 +431,34 @@ type actorDisplayLookup struct {
 }
 
 type actorDisplayLookupState struct {
-	members       map[string]string
-	agents        map[string]string
-	squads        map[string]string
-	membersLoaded bool
-	agentsLoaded  bool
-	squadsLoaded  bool
+	members        map[string]string
+	agents         map[string]string
+	squads         map[string]string
+	services       map[string]string
+	membersLoaded  bool
+	agentsLoaded   bool
+	squadsLoaded   bool
+	servicesLoaded bool
+}
+
+func (l actorDisplayLookup) loadServices() {
+	if l.state == nil || l.state.servicesLoaded {
+		return
+	}
+	l.state.servicesLoaded = true
+	l.state.services = map[string]string{}
+	if l.client == nil || l.client.WorkspaceID == "" {
+		return
+	}
+	var services []map[string]any
+	path := "/api/service-accounts?" + url.Values{"workspace_id": {l.client.WorkspaceID}}.Encode()
+	if err := l.client.GetJSON(l.ctx, path, &services); err == nil {
+		for _, s := range services {
+			if id := strVal(s, "id"); id != "" {
+				l.state.services[id] = strVal(s, "name")
+			}
+		}
+	}
 }
 
 func loadActorDisplayLookup(ctx context.Context, client *cli.APIClient) actorDisplayLookup {
@@ -529,6 +551,13 @@ func (l actorDisplayLookup) actor(actorType, id string) string {
 		if l.state != nil && l.state.squads != nil {
 			if name := l.state.squads[id]; name != "" {
 				return "squad:" + name
+			}
+		}
+	case "service_account":
+		l.loadServices()
+		if l.state != nil && l.state.services != nil {
+			if name := l.state.services[id]; name != "" {
+				return "service_account:" + name
 			}
 		}
 	}

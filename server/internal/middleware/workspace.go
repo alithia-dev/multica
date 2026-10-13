@@ -72,7 +72,7 @@ func ResolveWorkspaceIDFromRequest(r *http.Request, queries *db.Queries) string 
 	// workspace identifier on the request (slug header/query, ID
 	// query, URL param) is the agent trying to widen its blast
 	// radius — ignore it.
-	if r.Header.Get("X-Actor-Source") == "task_token" {
+	if source := r.Header.Get("X-Actor-Source"); source == "task_token" || source == "service_account" {
 		return r.Header.Get("X-Workspace-ID")
 	}
 	if id := WorkspaceIDFromContext(r.Context()); id != "" {
@@ -116,7 +116,7 @@ func resolveWorkspaceUUID(queries *db.Queries) workspaceResolver {
 		// token's bound workspace. The auth middleware wrote that ID
 		// into X-Workspace-ID; nothing the agent can put on the wire
 		// (slug header/query, id query, URL param) can override it.
-		if r.Header.Get("X-Actor-Source") == "task_token" {
+		if source := r.Header.Get("X-Actor-Source"); source == "task_token" || source == "service_account" {
 			id := r.Header.Get("X-Workspace-ID")
 			if id == "" {
 				return "", errWorkspaceNotFound
@@ -211,7 +211,7 @@ func buildMiddleware(queries *db.Queries, resolve workspaceResolver, roles []str
 			// allowed to operate on a workspace other than the one
 			// stamped into its task token. This is the catch-all
 			// behind resolveWorkspaceUUID's earlier check. MUL-2600.
-			if r.Header.Get("X-Actor-Source") == "task_token" {
+			if source := r.Header.Get("X-Actor-Source"); source == "task_token" || source == "service_account" {
 				bound := r.Header.Get("X-Workspace-ID")
 				if bound == "" || workspaceID != bound {
 					writeError(w, http.StatusForbidden, "task token is bound to a different workspace")
@@ -235,13 +235,22 @@ func buildMiddleware(queries *db.Queries, resolve workspaceResolver, roles []str
 				writeError(w, http.StatusBadRequest, "invalid workspace_id")
 				return
 			}
-			member, err := queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
-				UserID:      userUUID,
-				WorkspaceID: wsUUID,
-			})
-			if err != nil {
-				writeError(w, http.StatusNotFound, "workspace not found")
-				return
+			var member db.Member
+			if r.Header.Get("X-Actor-Source") == "service_account" {
+				role := r.Header.Get("X-Service-Account-Role")
+				if role != "member" && role != "admin" {
+					writeError(w, http.StatusUnauthorized, "invalid service account principal")
+					return
+				}
+				member = db.Member{ID: userUUID, UserID: userUUID, WorkspaceID: wsUUID, Role: role}
+			} else {
+				member, err = queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+					UserID: userUUID, WorkspaceID: wsUUID,
+				})
+				if err != nil {
+					writeError(w, http.StatusNotFound, "workspace not found")
+					return
+				}
 			}
 
 			if len(roles) > 0 {

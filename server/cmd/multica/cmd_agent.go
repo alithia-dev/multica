@@ -256,6 +256,12 @@ func newAPIClient(cmd *cobra.Command) (*cli.APIClient, error) {
 	if serverURL == "" {
 		return nil, fmt.Errorf("server URL not set: use --server-url flag, MULTICA_SERVER_URL env, or 'multica config set server_url <url>'")
 	}
+	// The dedicated GRIT orchestration profile is an attribution boundary,
+	// not merely a config namespace. Fail closed instead of silently using a
+	// human mul_ PAT when the service credential is absent or misconfigured.
+	if resolveProfile(cmd) == "grit" && !inDaemonManagedExecutionContext() && !strings.HasPrefix(token, "msa_") {
+		return nil, fmt.Errorf("profile grit requires a service-account msa_ token; refusing human attribution fallback")
+	}
 	if inDaemonManagedExecutionContext() && !strings.HasPrefix(token, "mat_") {
 		// When the ONLY daemon signal is a workdir marker (no MULTICA_AGENT_ID /
 		// MULTICA_TASK_ID / MULTICA_DAEMON_PORT), the likeliest cause outside a
@@ -281,7 +287,12 @@ func newAPIClient(cmd *cobra.Command) (*cli.APIClient, error) {
 	return client, nil
 }
 
-func resolveServerURL(cmd *cobra.Command) string {
+const (
+	defaultCloudServerURL = "https://api.multica.ai"
+	defaultCloudAppURL    = "https://multica.ai"
+)
+
+func tryResolveServerURL(cmd *cobra.Command) string {
 	val := cli.FlagOrEnv(cmd, "server-url", "MULTICA_SERVER_URL", "")
 	if val != "" {
 		return normalizeAPIBaseURL(val)
@@ -291,9 +302,23 @@ func resolveServerURL(cmd *cobra.Command) string {
 	if err == nil && cfg.ServerURL != "" {
 		return normalizeAPIBaseURL(cfg.ServerURL)
 	}
+	return ""
+}
+
+func resolveServerURL(cmd *cobra.Command) string {
+	if val := tryResolveServerURL(cmd); val != "" {
+		return val
+	}
 	fmt.Fprintln(os.Stderr, "No server configured. Run 'multica setup' first.")
 	os.Exit(1)
 	return "" // unreachable
+}
+
+func resolveLoginTokenServerURL(cmd *cobra.Command) string {
+	if val := tryResolveServerURL(cmd); val != "" {
+		return val
+	}
+	return defaultCloudServerURL
 }
 
 func normalizeAPIBaseURL(raw string) string {

@@ -10,6 +10,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -43,6 +44,112 @@ func newRedisTestClient(t *testing.T) *redis.Client {
 		rdb.Close()
 	})
 	return rdb
+}
+
+func TestAuth_ServiceAccountStampsIndependentPrincipal(t *testing.T) {
+	pool := openPool(t)
+	t.Cleanup(pool.Close)
+	ctx := context.Background()
+	var userID, workspaceID, serviceID string
+	if err := pool.QueryRow(ctx, `INSERT INTO "user" (name,email) VALUES ('Service Creator','service-auth-test@multica.test') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workspace (name,slug,issue_prefix) VALUES ('Service Auth Test','service-auth-test','SAT') RETURNING id`).Scan(&workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO service_account (workspace_id,name,slug,role,created_by_user_id) VALUES ($1,'GRIT Admin','grit-admin','member',$2) RETURNING id`, workspaceID, userID).Scan(&serviceID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM workspace WHERE id=$1`, workspaceID); err != nil {
+			t.Errorf("delete service auth workspace fixture: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM "user" WHERE id=$1`, userID); err != nil {
+			t.Errorf("delete service auth user fixture: %v", err)
+		}
+	})
+	raw, err := auth.GenerateServiceAccountToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO service_account_token (service_account_id,name,token_hash,token_prefix) VALUES ($1,'test',$2,'msa_test')`, serviceID, auth.HashToken(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotUser, gotService, gotRole, gotWorkspace, gotSource string
+	handler := Auth(db.New(pool), nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotService = r.Header.Get("X-User-ID"), r.Header.Get("X-Service-Account-ID")
+		gotRole, gotWorkspace, gotSource = r.Header.Get("X-Service-Account-Role"), r.Header.Get("X-Workspace-ID"), r.Header.Get("X-Actor-Source")
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/issues", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if gotUser != serviceID || gotService != serviceID || gotRole != "member" || gotWorkspace != workspaceID || gotSource != "service_account" {
+		t.Fatalf("principal user=%s service=%s role=%s workspace=%s source=%s", gotUser, gotService, gotRole, gotWorkspace, gotSource)
+	}
+}
+
+func TestAuth_ServiceAccountWorkspaceDeletionRevokesToken(t *testing.T) {
+	pool := openPool(t)
+	t.Cleanup(pool.Close)
+	ctx := context.Background()
+	var userID, workspaceID, serviceID string
+	if err := pool.QueryRow(ctx, `INSERT INTO "user" (name,email) VALUES ('Lifecycle Creator','service-lifecycle-test@multica.test') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workspace (name,slug,issue_prefix) VALUES ('Service Lifecycle Test','service-lifecycle-test','SLT') RETURNING id`).Scan(&workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO service_account (workspace_id,name,slug,role,created_by_user_id) VALUES ($1,'Lifecycle Service','lifecycle-service','member',$2) RETURNING id`, workspaceID, userID).Scan(&serviceID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM workspace WHERE id=$1`, workspaceID); err != nil {
+			t.Errorf("delete service lifecycle workspace fixture: %v", err)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM "user" WHERE id=$1`, userID); err != nil {
+			t.Errorf("delete service lifecycle user fixture: %v", err)
+		}
+	})
+	raw, err := auth.GenerateServiceAccountToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO service_account_token (service_account_id,name,token_hash,token_prefix) VALUES ($1,'lifecycle',$2,$3)`, serviceID, auth.HashToken(raw), raw[:12]); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM workspace WHERE id=$1`, workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	var accountCount, tokenCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM service_account WHERE id=$1`, serviceID).Scan(&accountCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM service_account_token WHERE service_account_id=$1`, serviceID).Scan(&tokenCount); err != nil {
+		t.Fatal(err)
+	}
+	if accountCount != 0 || tokenCount != 0 {
+		t.Fatalf("workspace deletion left service rows: accounts=%d tokens=%d", accountCount, tokenCount)
+	}
+
+	handler := Auth(db.New(pool), nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("deleted workspace token reached authenticated handler")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/issues", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", w.Code, w.Body.String())
+	}
 }
 
 func generateToken(claims jwt.MapClaims, secret []byte) string {

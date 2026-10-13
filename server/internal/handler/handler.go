@@ -66,7 +66,7 @@ type Config struct {
 	// the UI can hide every "Create workspace" affordance — see #3433.
 	DisableWorkspaceCreation bool
 	// PublicURL is the absolute base URL the API is reachable at from the
-	// public internet, with no trailing slash (e.g. "https://app.multica.ai").
+	// public internet, with no trailing slash (e.g. "https://multica.ai").
 	// Used only to build webhook_url responses for autopilot webhook triggers
 	// — never for auth, routing, or workspace resolution. Empty when unset,
 	// in which case clients fall back to webhook_path + their own origin.
@@ -107,6 +107,11 @@ type Config struct {
 	LLMAPIKey       string
 	LLMBaseURL      string
 	LLMDefaultModel string
+	// ServerVersion is the build version of the running API binary (the same
+	// value main.go stamps via -X main.version and reports on /metrics).
+	// Surfaced through /api/config so self-hosted operators can confirm which
+	// server build is deployed. Empty in dev builds.
+	ServerVersion string
 }
 
 type cloudRuntimeProxy interface {
@@ -118,39 +123,46 @@ type RuntimeProfileRefreshNotifier interface {
 	NotifyRuntimeProfilesChanged(workspaceID, profileID string)
 }
 
+type WorkspaceSetRefreshNotifier interface {
+	NotifyWorkspacesChanged(userID string)
+}
+
 type Handler struct {
-	Queries               *db.Queries
-	DB                    dbExecutor
-	TxStarter             txStarter
-	Hub                   *realtime.Hub
-	DaemonHub             *daemonws.Hub
-	DaemonProfileRefresh  RuntimeProfileRefreshNotifier
-	Bus                   *events.Bus
-	TaskService           *service.TaskService
-	IssueService          *service.IssueService
-	AutopilotService      *service.AutopilotService
-	EmailService          *service.EmailService
-	UpdateStore           UpdateStore
-	ModelListStore        ModelListStore
-	LocalSkillListStore   LocalSkillListStore
-	LocalSkillImportStore LocalSkillImportStore
-	FeatureFlags          *featureflag.Service
-	LivenessStore         LivenessStore
-	HeartbeatScheduler    HeartbeatScheduler
-	Storage               storage.Storage
-	CFSigner              *auth.CloudFrontSigner
-	Analytics             analytics.Client
+	Queries                *db.Queries
+	DB                     dbExecutor
+	TxStarter              txStarter
+	Hub                    *realtime.Hub
+	DaemonHub              *daemonws.Hub
+	DaemonProfileRefresh   RuntimeProfileRefreshNotifier
+	DaemonWorkspaceRefresh WorkspaceSetRefreshNotifier
+	Bus                    *events.Bus
+	TaskService            *service.TaskService
+	IssueService           *service.IssueService
+	AutopilotService       *service.AutopilotService
+	EmailService           *service.EmailService
+	UpdateStore            UpdateStore
+	ModelListStore         ModelListStore
+	LocalSkillListStore    LocalSkillListStore
+	LocalSkillImportStore  LocalSkillImportStore
+	FeatureFlags           *featureflag.Service
+	LivenessStore          LivenessStore
+	HeartbeatScheduler     HeartbeatScheduler
+	Storage                storage.Storage
+	CFSigner               *auth.CloudFrontSigner
+	Analytics              analytics.Client
 	// Metrics is the shared business-metrics collector built by main.go.
 	// May be nil in tests / self-hosted with the metrics listener disabled;
 	// every Record* method is nil-safe and obsmetrics.RecordEvent treats a
 	// nil Metrics as "PostHog only".
-	Metrics              *obsmetrics.BusinessMetrics
-	PATCache             *auth.PATCache
-	DaemonTokenCache     *auth.DaemonTokenCache
-	MembershipCache      *auth.MembershipCache
-	WebhookRateLimiter   WebhookRateLimiter
-	WebhookIPRateLimiter WebhookRateLimiter
-	CloudRuntime         cloudRuntimeProxy
+	Metrics                      *obsmetrics.BusinessMetrics
+	PATCache                     *auth.PATCache
+	DaemonTokenCache             *auth.DaemonTokenCache
+	MembershipCache              *auth.MembershipCache
+	WebhookRateLimiter           WebhookRateLimiter
+	WebhookIPRateLimiter         WebhookRateLimiter
+	WebhookAbsoluteIPRateLimiter WebhookRateLimiter
+	WebhookDeliveryWorker        *WebhookDeliveryWorker
+	CloudRuntime                 cloudRuntimeProxy
 	// Lark integration. All three are nil when the Lark master key
 	// (MULTICA_LARK_SECRET_KEY) is unset; the corresponding HTTP
 	// handlers return 503 in that case so a misconfigured self-host
@@ -243,35 +255,39 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		daemonHub = daemonHubs[0]
 	}
 	var daemonProfileRefresh RuntimeProfileRefreshNotifier
+	var daemonWorkspaceRefresh WorkspaceSetRefreshNotifier
 	if daemonHub != nil {
 		daemonProfileRefresh = daemonHub
+		daemonWorkspaceRefresh = daemonHub
 	}
 
 	taskSvc := service.NewTaskService(queries, txStarter, hub, bus, daemonHub)
 	taskSvc.Analytics = analyticsClient
-	return &Handler{
-		Queries:               queries,
-		DB:                    executor,
-		TxStarter:             txStarter,
-		Hub:                   hub,
-		DaemonHub:             daemonHub,
-		DaemonProfileRefresh:  daemonProfileRefresh,
-		Bus:                   bus,
-		TaskService:           taskSvc,
-		IssueService:          service.NewIssueService(queries, txStarter, bus, analyticsClient, taskSvc),
-		AutopilotService:      service.NewAutopilotService(queries, txStarter, bus, taskSvc),
-		EmailService:          emailService,
-		UpdateStore:           NewInMemoryUpdateStore(),
-		ModelListStore:        NewInMemoryModelListStore(),
-		LocalSkillListStore:   NewInMemoryLocalSkillListStore(),
-		LocalSkillImportStore: NewInMemoryLocalSkillImportStore(),
-		LivenessStore:         NewNoopLivenessStore(),
-		HeartbeatScheduler:    NewPassthroughHeartbeatScheduler(queries),
-		Storage:               store,
-		CFSigner:              cfSigner,
-		Analytics:             analyticsClient,
-		WebhookRateLimiter:    NewMemoryWebhookRateLimiter(DefaultWebhookRateLimit()),
-		WebhookIPRateLimiter:  NewMemoryWebhookIPRateLimiter(DefaultWebhookIPRateLimit()),
+	h := &Handler{
+		Queries:                      queries,
+		DB:                           executor,
+		TxStarter:                    txStarter,
+		Hub:                          hub,
+		DaemonHub:                    daemonHub,
+		DaemonProfileRefresh:         daemonProfileRefresh,
+		DaemonWorkspaceRefresh:       daemonWorkspaceRefresh,
+		Bus:                          bus,
+		TaskService:                  taskSvc,
+		IssueService:                 service.NewIssueService(queries, txStarter, bus, analyticsClient, taskSvc),
+		AutopilotService:             service.NewAutopilotService(queries, txStarter, bus, taskSvc),
+		EmailService:                 emailService,
+		UpdateStore:                  NewInMemoryUpdateStore(),
+		ModelListStore:               NewInMemoryModelListStore(),
+		LocalSkillListStore:          NewInMemoryLocalSkillListStore(),
+		LocalSkillImportStore:        NewInMemoryLocalSkillImportStore(),
+		LivenessStore:                NewNoopLivenessStore(),
+		HeartbeatScheduler:           NewPassthroughHeartbeatScheduler(queries),
+		Storage:                      store,
+		CFSigner:                     cfSigner,
+		Analytics:                    analyticsClient,
+		WebhookRateLimiter:           NewMemoryWebhookRateLimiter(DefaultWebhookRateLimit()),
+		WebhookIPRateLimiter:         NewMemoryWebhookIPRateLimiter(DefaultWebhookIPRateLimit()),
+		WebhookAbsoluteIPRateLimiter: NewMemoryWebhookAbsoluteIPRateLimiter(DefaultWebhookAbsoluteIPRateLimit()),
 		CloudRuntime: cloudruntime.NewClient(cloudruntime.Config{
 			BaseURL: cfg.CloudRuntimeFleetURL,
 			Timeout: cfg.CloudRuntimeFleetTimeout,
@@ -283,6 +299,8 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		}),
 		cfg: cfg,
 	}
+	h.WebhookDeliveryWorker = NewWebhookDeliveryWorker(h)
+	return h
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -425,6 +443,23 @@ func (h *Handler) publish(eventType, workspaceID, actorType, actorID string, pay
 	})
 }
 
+func (h *Handler) notifyDaemonWorkspacesChanged(userIDs ...string) {
+	if h.DaemonWorkspaceRefresh == nil {
+		return
+	}
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == "" {
+			continue
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		h.DaemonWorkspaceRefresh.NotifyWorkspacesChanged(userID)
+	}
+}
+
 // publishTask is publish() plus a TaskID hint so the realtime layer can route
 // the event to the per-task scope rather than the whole workspace.
 func (h *Handler) publishTask(eventType, workspaceID, actorType, actorID, taskID string, payload any) {
@@ -491,44 +526,51 @@ func requestUserID(r *http.Request) string {
 // review). The daemon always pairs the two headers, so requiring both has
 // no effect on legitimate agent callers but closes the impersonation path.
 //
-// Returns ("agent", agentID) on success, ("member", userID) otherwise.
+// Returns ("agent", agentID) on valid task attribution. Otherwise it returns
+// the authenticated principal: service_account for msa_ tokens, member for
+// human JWT/PAT traffic. Invalid agent headers therefore never relabel a
+// service operation as the creating human.
 func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (actorType, actorID string) {
 	if r.Header.Get("X-Actor-Source") == "task_token" {
 		// Server-set header — auth middleware also forced X-Agent-ID
 		// from the token row. Trust it directly without re-querying.
 		return "agent", r.Header.Get("X-Agent-ID")
 	}
+	fallbackType, fallbackID := "member", userID
+	if r.Header.Get("X-Actor-Source") == "service_account" {
+		fallbackType, fallbackID = "service_account", r.Header.Get("X-Service-Account-ID")
+	}
 	agentID := r.Header.Get("X-Agent-ID")
 	if agentID == "" {
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 	taskID := r.Header.Get("X-Task-ID")
 	if taskID == "" {
 		slog.Debug("resolveActor: X-Agent-ID present but X-Task-ID missing, refusing to trust agent identity", "agent_id", agentID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 
 	agentUUID, err := util.ParseUUID(agentID)
 	if err != nil {
 		slog.Debug("resolveActor: X-Agent-ID is not a valid UUID, falling back to member", "agent_id", agentID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 	// Validate the agent exists in the target workspace.
 	agent, err := h.Queries.GetAgent(r.Context(), agentUUID)
 	if err != nil || uuidToString(agent.WorkspaceID) != workspaceID {
 		slog.Debug("resolveActor: X-Agent-ID rejected, agent not found or workspace mismatch", "agent_id", agentID, "workspace_id", workspaceID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 
 	taskUUID, err := util.ParseUUID(taskID)
 	if err != nil {
 		slog.Debug("resolveActor: X-Task-ID is not a valid UUID, falling back to member", "task_id", taskID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
 	if err != nil || uuidToString(task.AgentID) != agentID {
 		slog.Debug("resolveActor: X-Task-ID rejected, task not found or agent mismatch", "agent_id", agentID, "task_id", taskID)
-		return "member", userID
+		return fallbackType, fallbackID
 	}
 
 	return "agent", agentID
@@ -619,6 +661,9 @@ func (h *Handler) requireWorkspaceMember(w http.ResponseWriter, r *http.Request,
 	if workspaceID == "" {
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
 		return db.Member{}, false
+	}
+	if member, ok := ctxMember(r.Context()); ok && ctxWorkspaceID(r.Context()) == workspaceID {
+		return member, true
 	}
 
 	userID, ok := requireUserID(w, r)
@@ -806,6 +851,10 @@ func (h *Handler) loadAgentForUser(w http.ResponseWriter, r *http.Request, agent
 		WorkspaceID: wsUUID,
 	})
 	if err != nil {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return db.Agent{}, false
+	}
+	if agent.Kind != "user" {
 		writeError(w, http.StatusNotFound, "agent not found")
 		return db.Agent{}, false
 	}
