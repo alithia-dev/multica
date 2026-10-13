@@ -45,6 +45,17 @@ type TaskWakeupNotifier interface {
 // recognisable preview of a one-paragraph comment.
 const triggerSummaryMaxLen = 200
 
+type CancellationMetadata struct {
+	Reason             string
+	CancelledByType    string
+	CancelledByID      pgtype.UUID
+	SupersededByTaskID pgtype.UUID
+}
+
+func cancellationText(s string) pgtype.Text {
+	return pgtype.Text{String: s, Valid: s != ""}
+}
+
 // truncateForSummary returns s shortened to maxRunes, with a trailing
 // `…` when truncated. Operates on runes (not bytes) so multibyte characters
 // — Chinese / emoji — count as one each. Strips surrounding whitespace
@@ -313,14 +324,21 @@ func (s *TaskService) EnqueueChatTask(ctx context.Context, chatSession db.ChatSe
 // running) left the agent stuck at status="working" indefinitely, requiring a
 // manual `multica agent update <id> --status idle` to unwedge. Matches the
 // pattern already used by CancelTask and RerunIssue.
-func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UUID) error {
-	cancelled, err := s.Queries.CancelAgentTasksByIssue(ctx, issueID)
+func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UUID, meta CancellationMetadata) error {
+	cancelled, err := s.Queries.CancelAgentTasksByIssue(ctx, db.CancelAgentTasksByIssueParams{
+		IssueID:            issueID,
+		CancelledReason:    cancellationText(meta.Reason),
+		CancelledByType:    cancellationText(meta.CancelledByType),
+		CancelledByID:      meta.CancelledByID,
+		SupersededByTaskID: meta.SupersededByTaskID,
+	})
 	if err != nil {
 		return err
 	}
 	for _, t := range cancelled {
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+		s.maybeCreateCancellationComment(ctx, t)
 	}
 	return nil
 }
@@ -331,13 +349,20 @@ func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UU
 // tasks" action — same shape as CancelTasksForIssue but scoped on agent_id.
 //
 // Returns the cancelled rows so callers can report counts / log them.
-func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	cancelled, err := s.Queries.CancelAgentTasksByAgent(ctx, agentID)
+func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UUID, meta CancellationMetadata) ([]db.AgentTaskQueue, error) {
+	cancelled, err := s.Queries.CancelAgentTasksByAgent(ctx, db.CancelAgentTasksByAgentParams{
+		AgentID:            agentID,
+		CancelledReason:    cancellationText(meta.Reason),
+		CancelledByType:    cancellationText(meta.CancelledByType),
+		CancelledByID:      meta.CancelledByID,
+		SupersededByTaskID: meta.SupersededByTaskID,
+	})
 	if err != nil {
 		return nil, err
 	}
 	for _, t := range cancelled {
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+		s.maybeCreateCancellationComment(ctx, t)
 	}
 	// Reconcile once after the loop — agent transitions from
 	// working→available based on remaining task counts, no need to call
@@ -352,22 +377,35 @@ func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UU
 // the comment row is deleted because the FK ON DELETE SET NULL would
 // otherwise nullify trigger_comment_id and we'd lose the ability to find
 // the affected tasks.
-func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID pgtype.UUID) error {
-	cancelled, err := s.Queries.CancelAgentTasksByTriggerComment(ctx, commentID)
+func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID pgtype.UUID, meta CancellationMetadata) error {
+	cancelled, err := s.Queries.CancelAgentTasksByTriggerComment(ctx, db.CancelAgentTasksByTriggerCommentParams{
+		TriggerCommentID:   commentID,
+		CancelledReason:    cancellationText(meta.Reason),
+		CancelledByType:    cancellationText(meta.CancelledByType),
+		CancelledByID:      meta.CancelledByID,
+		SupersededByTaskID: meta.SupersededByTaskID,
+	})
 	if err != nil {
 		return err
 	}
 	for _, t := range cancelled {
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+		s.maybeCreateCancellationComment(ctx, t)
 	}
 	return nil
 }
 
 // CancelTask cancels a single task by ID. It broadcasts a task:cancelled event
 // so frontends can update immediately.
-func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	task, err := s.Queries.CancelAgentTask(ctx, taskID)
+func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID, meta CancellationMetadata) (*db.AgentTaskQueue, error) {
+	task, err := s.Queries.CancelAgentTask(ctx, db.CancelAgentTaskParams{
+		ID:                 taskID,
+		CancelledReason:    cancellationText(meta.Reason),
+		CancelledByType:    cancellationText(meta.CancelledByType),
+		CancelledByID:      meta.CancelledByID,
+		SupersededByTaskID: meta.SupersededByTaskID,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, err := s.Queries.GetAgentTask(ctx, taskID)
 		if err != nil {
@@ -386,6 +424,7 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 
 	// Broadcast cancellation as a task:failed event so frontends clear the live card
 	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+	s.maybeCreateCancellationComment(ctx, task)
 
 	return &task, nil
 }
@@ -946,8 +985,10 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, trigg
 	// covers both the unique-index conflict (queued/dispatched) and a
 	// stuck running task without touching other agents on the issue.
 	cancelled, err := s.Queries.CancelAgentTasksByIssueAndAgent(ctx, db.CancelAgentTasksByIssueAndAgentParams{
-		IssueID: issueID,
-		AgentID: issue.AssigneeID,
+		IssueID:         issueID,
+		AgentID:         issue.AssigneeID,
+		CancelledReason: cancellationText("manual_rerun"),
+		CancelledByType: cancellationText("system"),
 	})
 	if err != nil {
 		slog.Warn("rerun: cancel prior tasks failed",
@@ -959,6 +1000,7 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, trigg
 	for _, t := range cancelled {
 		s.ReconcileAgentStatus(ctx, t.AgentID)
 		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
+		s.maybeCreateCancellationComment(ctx, t)
 	}
 
 	task, err := s.enqueueIssueTask(ctx, issue, triggerCommentID, true)
@@ -1404,6 +1446,30 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 			"issue_status": issue.Status,
 		},
 	})
+}
+
+func (s *TaskService) maybeCreateCancellationComment(ctx context.Context, task db.AgentTaskQueue) {
+	if !task.IssueID.Valid || !task.TriggerCommentID.Valid {
+		return
+	}
+	if task.CancelledReason.Valid && task.CancelledReason.String == "comment_deleted" {
+		return
+	}
+	commented, err := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
+		IssueID:  task.IssueID,
+		AuthorID: task.AgentID,
+		Since:    task.CreatedAt,
+	})
+	if err == nil && commented {
+		return
+	}
+	reason := "unknown"
+	if task.CancelledReason.Valid && task.CancelledReason.String != "" {
+		reason = task.CancelledReason.String
+	}
+	runID := util.UUIDToString(task.ID)
+	content := fmt.Sprintf("Agent run `%s` was cancelled before the agent posted a reply. Reason: `%s`. It is safe to rerun if the request is still needed.", runID, reason)
+	s.createAgentComment(ctx, task.IssueID, task.AgentID, content, "system", task.TriggerCommentID)
 }
 
 func issueToMap(issue db.Issue, issuePrefix string) map[string]any {

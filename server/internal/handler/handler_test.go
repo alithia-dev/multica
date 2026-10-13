@@ -2116,6 +2116,81 @@ func TestAgentReplyDoesNotInheritParentMentions(t *testing.T) {
 	}
 }
 
+func TestMentionTaskCancelledBeforeReplyLeavesSystemComment(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	agentID := createHandlerTestAgent(t, "Mention Cancel Visibility", nil)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Mention cancellation visibility test",
+		"status": "todo",
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var issue IssueResponse
+	json.NewDecoder(w.Body).Decode(&issue)
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issue.ID)
+		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issue.ID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+	})
+
+	w = httptest.NewRecorder()
+	req = newRequest("POST", "/api/issues/"+issue.ID+"/comments", map[string]any{
+		"content": fmt.Sprintf("[@Mention Cancel Visibility](mention://agent/%s) please handle this", agentID),
+	})
+	req = withURLParam(req, "id", issue.ID)
+	testHandler.CreateComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var trigger CommentResponse
+	json.NewDecoder(w.Body).Decode(&trigger)
+
+	if err := testHandler.TaskService.CancelTasksForIssue(ctx, parseUUID(issue.ID), service.CancellationMetadata{
+		Reason:          "superseded_by_assignee_change",
+		CancelledByType: "member",
+		CancelledByID:   parseUUID(testUserID),
+	}); err != nil {
+		t.Fatalf("CancelTasksForIssue: %v", err)
+	}
+
+	var status, reason string
+	err := testPool.QueryRow(ctx,
+		`SELECT status, cancelled_reason FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`,
+		issue.ID, agentID,
+	).Scan(&status, &reason)
+	if err != nil {
+		t.Fatalf("load cancelled task: %v", err)
+	}
+	if status != "cancelled" || reason != "superseded_by_assignee_change" {
+		t.Fatalf("task metadata = (%q, %q), want (cancelled, superseded_by_assignee_change)", status, reason)
+	}
+
+	var content, parentID string
+	err = testPool.QueryRow(ctx,
+		`SELECT content, parent_id::text FROM comment WHERE issue_id = $1 AND author_type = 'agent' AND type = 'system'`,
+		issue.ID,
+	).Scan(&content, &parentID)
+	if err != nil {
+		t.Fatalf("load system comment: %v", err)
+	}
+	if !strings.Contains(content, "was cancelled before the agent posted a reply") ||
+		!strings.Contains(content, "superseded_by_assignee_change") {
+		t.Fatalf("system comment content did not explain cancellation: %q", content)
+	}
+	if parentID != trigger.ID {
+		t.Fatalf("system comment parent_id = %q, want trigger comment %q", parentID, trigger.ID)
+	}
+}
+
 // TestMemberReplyToAgentRootDoesNotInheritParentMentions is the regression
 // for MUL-1535. When an agent posts a comment that @mentions another agent
 // (e.g. J posting a PR completion that @mentions a reviewer agent), a later

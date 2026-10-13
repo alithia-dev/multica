@@ -81,7 +81,7 @@ function groupItems(items: MentionItem[]): MentionGroup[] {
   }
 
   const groups: MentionGroup[] = [];
-  if (users.length > 0) groups.push({ label: "Users", items: users });
+  if (users.length > 0) groups.push({ label: "People and agents", items: users });
   if (issues.length > 0) groups.push({ label: "Issues", items: issues });
   return groups;
 }
@@ -323,6 +323,11 @@ function MentionRow({
         showStatusDot
       />
       <span className="truncate font-medium">{item.label}</span>
+      {item.type === "member" && (
+        <Badge variant="secondary" className="ml-auto h-4 px-1.5 text-[10px]">
+          Member
+        </Badge>
+      )}
       {item.type === "agent" && (
         <Badge variant="outline" className="ml-auto text-[10px] h-4 px-1.5">Agent</Badge>
       )}

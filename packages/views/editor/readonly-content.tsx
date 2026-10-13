@@ -276,7 +276,17 @@ function ReadonlyLink({
       return <IssueMentionLink issueId={match[2]} label={label} />;
     }
     // Member / agent / all mentions
-    return <span className="mention">{children}</span>;
+    const title =
+      match?.[1] === "agent"
+        ? "Agent mention: enqueues a run"
+        : match?.[1] === "member"
+          ? "Member mention: notifies a person"
+          : undefined;
+    return (
+      <span className="mention" title={title}>
+        {children}
+      </span>
+    );
   }
 
   // Regular links — open directly on click

@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -471,7 +472,11 @@ func (h *Handler) CancelTaskByUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cancelled, err := h.TaskService.CancelTask(r.Context(), taskUUID)
+	cancelled, err := h.TaskService.CancelTask(r.Context(), taskUUID, service.CancellationMetadata{
+		Reason:          "user_cancelled_task",
+		CancelledByType: "member",
+		CancelledByID:   parseUUID(userID),
+	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

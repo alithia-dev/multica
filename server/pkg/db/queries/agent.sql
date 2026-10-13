@@ -121,7 +121,12 @@ RETURNING *;
 -- paths (issue status flips to cancelled/done, etc.) left agents stuck at
 -- status="working" with no self-correction.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now()
+SET status = 'cancelled',
+    completed_at = now(),
+    cancelled_reason = sqlc.narg('cancelled_reason'),
+    cancelled_by_type = sqlc.narg('cancelled_by_type'),
+    cancelled_by_id = sqlc.narg('cancelled_by_id'),
+    superseded_by_task_id = sqlc.narg('superseded_by_task_id')
 WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running')
 RETURNING *;
 
@@ -131,7 +136,12 @@ RETURNING *;
 -- rerun flow so re-running the assignee doesn't collateral-cancel a
 -- still-running @-mention agent on the same issue.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now()
+SET status = 'cancelled',
+    completed_at = now(),
+    cancelled_reason = sqlc.narg('cancelled_reason'),
+    cancelled_by_type = sqlc.narg('cancelled_by_type'),
+    cancelled_by_id = sqlc.narg('cancelled_by_id'),
+    superseded_by_task_id = sqlc.narg('superseded_by_task_id')
 WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched', 'running')
 RETURNING *;
 
@@ -142,7 +152,12 @@ RETURNING *;
 -- (also :many + RETURNING + completed_at) so the three sibling cancel paths
 -- behave consistently.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now()
+SET status = 'cancelled',
+    completed_at = now(),
+    cancelled_reason = sqlc.narg('cancelled_reason'),
+    cancelled_by_type = sqlc.narg('cancelled_by_type'),
+    cancelled_by_id = sqlc.narg('cancelled_by_id'),
+    superseded_by_task_id = sqlc.narg('superseded_by_task_id')
 WHERE agent_id = $1 AND status IN ('queued', 'dispatched', 'running')
 RETURNING *;
 
@@ -153,7 +168,12 @@ RETURNING *;
 -- because the FK ON DELETE SET NULL would otherwise nullify trigger_comment_id
 -- and we'd lose the ability to find the affected tasks.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now()
+SET status = 'cancelled',
+    completed_at = now(),
+    cancelled_reason = sqlc.narg('cancelled_reason'),
+    cancelled_by_type = sqlc.narg('cancelled_by_type'),
+    cancelled_by_id = sqlc.narg('cancelled_by_id'),
+    superseded_by_task_id = sqlc.narg('superseded_by_task_id')
 WHERE trigger_comment_id = $1 AND status IN ('queued', 'dispatched', 'running')
 RETURNING *;
 
@@ -291,7 +311,12 @@ RETURNING *;
 
 -- name: CancelAgentTask :one
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now()
+SET status = 'cancelled',
+    completed_at = now(),
+    cancelled_reason = sqlc.narg('cancelled_reason'),
+    cancelled_by_type = sqlc.narg('cancelled_by_type'),
+    cancelled_by_id = sqlc.narg('cancelled_by_id'),
+    superseded_by_task_id = sqlc.narg('superseded_by_task_id')
 WHERE id = $1 AND status IN ('queued', 'dispatched', 'running')
 RETURNING *;
 

@@ -33,6 +33,18 @@ export type TaskFailureReason =
   | "runtime_recovery"
   | "manual";
 
+export type TaskCancellationReason =
+  | "agent_archived"
+  | "comment_deleted"
+  | "issue_cancelled"
+  | "issue_deleted"
+  | "manual_rerun"
+  | "server_workspace_isolation"
+  | "superseded_by_assignee_change"
+  | "user_cancelled_agent_tasks"
+  | "user_cancelled_task"
+  | string;
+
 // One daily bucket for the Agents-list ACTIVITY sparkline. The back-end
 // only returns days that had at least one completion; the front-end fills
 // in missing days with zero when rendering the 7-bucket series. The series
@@ -69,6 +81,10 @@ export interface AgentTask {
   // Empty string when the task is not in a failed state (the backend uses
   // `omitempty`, so the field may also be missing on non-failed tasks).
   failure_reason?: TaskFailureReason | "";
+  cancelled_reason?: TaskCancellationReason | "";
+  cancelled_by_type?: "member" | "agent" | "system" | "scheduler" | "server" | "";
+  cancelled_by_id?: string | null;
+  superseded_by_task_id?: string | null;
   created_at: string;
   /** Non-empty when the task was spawned from a chat session. */
   chat_session_id?: string;

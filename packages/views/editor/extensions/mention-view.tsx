@@ -31,9 +31,18 @@ export function MentionView({ node }: NodeViewProps) {
     );
   }
 
+  const title =
+    type === "agent"
+      ? "Agent mention: enqueues a run"
+      : type === "member"
+        ? "Member mention: notifies a person"
+        : undefined;
+
   return (
     <NodeViewWrapper as="span" className="inline">
-      <span className="mention">@{label ?? id}</span>
+      <span className="mention" title={title}>
+        @{label ?? id}
+      </span>
     </NodeViewWrapper>
   );
 }

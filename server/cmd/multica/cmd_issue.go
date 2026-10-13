@@ -919,7 +919,7 @@ func runIssueRuns(cmd *cobra.Command, args []string) error {
 		return cli.PrintJSON(os.Stdout, runs)
 	}
 
-	headers := []string{"ID", "AGENT", "STATUS", "STARTED", "COMPLETED", "ERROR"}
+	headers := []string{"ID", "AGENT", "STATUS", "STARTED", "COMPLETED", "REASON", "ERROR"}
 	rows := make([][]string, 0, len(runs))
 	for _, r := range runs {
 		started := strVal(r, "started_at")
@@ -935,12 +935,17 @@ func runIssueRuns(cmd *cobra.Command, args []string) error {
 			runes := []rune(errMsg)
 			errMsg = string(runes[:47]) + "..."
 		}
+		reason := strVal(r, "failure_reason")
+		if reason == "" {
+			reason = strVal(r, "cancelled_reason")
+		}
 		rows = append(rows, []string{
 			truncateID(strVal(r, "id")),
 			truncateID(strVal(r, "agent_id")),
 			strVal(r, "status"),
 			started,
 			completed,
+			reason,
 			errMsg,
 		})
 	}

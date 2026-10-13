@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/mention"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -617,7 +618,11 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 	// run with the now-deleted content already embedded in its prompt. Must
 	// run before DeleteComment because the FK ON DELETE SET NULL would
 	// otherwise nullify trigger_comment_id and orphan those tasks in queued.
-	if err := h.TaskService.CancelTasksByTriggerComment(r.Context(), comment.ID); err != nil {
+	if err := h.TaskService.CancelTasksByTriggerComment(r.Context(), comment.ID, service.CancellationMetadata{
+		Reason:          "comment_deleted",
+		CancelledByType: actorType,
+		CancelledByID:   parseUUID(actorID),
+	}); err != nil {
 		slog.Warn("cancel tasks for deleted trigger comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", commentId)...)
 	}
 

@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -26,33 +27,33 @@ import (
 
 // IssueResponse is the JSON response for an issue.
 type IssueResponse struct {
-	ID                 string                  `json:"id"`
-	WorkspaceID        string                  `json:"workspace_id"`
-	Number             int32                   `json:"number"`
-	Identifier         string                  `json:"identifier"`
-	Title              string                  `json:"title"`
-	Description        *string                 `json:"description"`
-	Status             string                  `json:"status"`
-	Priority           string                  `json:"priority"`
-	AssigneeType       *string                 `json:"assignee_type"`
-	AssigneeID         *string                 `json:"assignee_id"`
-	CreatorType        string                  `json:"creator_type"`
-	CreatorID          string                  `json:"creator_id"`
-	ParentIssueID      *string                 `json:"parent_issue_id"`
-	ProjectID          *string                 `json:"project_id"`
-	Position           float64                 `json:"position"`
-	DueDate            *string                 `json:"due_date"`
-	CreatedAt          string                  `json:"created_at"`
-	UpdatedAt          string                  `json:"updated_at"`
-	Reactions          []IssueReactionResponse `json:"reactions,omitempty"`
-	Attachments        []AttachmentResponse    `json:"attachments,omitempty"`
+	ID            string                  `json:"id"`
+	WorkspaceID   string                  `json:"workspace_id"`
+	Number        int32                   `json:"number"`
+	Identifier    string                  `json:"identifier"`
+	Title         string                  `json:"title"`
+	Description   *string                 `json:"description"`
+	Status        string                  `json:"status"`
+	Priority      string                  `json:"priority"`
+	AssigneeType  *string                 `json:"assignee_type"`
+	AssigneeID    *string                 `json:"assignee_id"`
+	CreatorType   string                  `json:"creator_type"`
+	CreatorID     string                  `json:"creator_id"`
+	ParentIssueID *string                 `json:"parent_issue_id"`
+	ProjectID     *string                 `json:"project_id"`
+	Position      float64                 `json:"position"`
+	DueDate       *string                 `json:"due_date"`
+	CreatedAt     string                  `json:"created_at"`
+	UpdatedAt     string                  `json:"updated_at"`
+	Reactions     []IssueReactionResponse `json:"reactions,omitempty"`
+	Attachments   []AttachmentResponse    `json:"attachments,omitempty"`
 	// Labels are bulk-attached by list/detail endpoints so the client can render
 	// chips without an N+1 round-trip per row. Pointer + omitempty so paths that
 	// don't load labels (e.g. UpdateIssue, batch UpdateIssues, the issue:updated
 	// WS broadcast) emit no `labels` field at all — the client merge then
 	// preserves whatever labels are already in cache. nil pointer = "field
 	// absent, do not touch"; non-nil (incl. empty slice) = authoritative list.
-	Labels             *[]LabelResponse        `json:"labels,omitempty"`
+	Labels *[]LabelResponse `json:"labels,omitempty"`
 }
 
 func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
@@ -286,7 +287,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	}
 
 	escapedPhrase := escapeLike(phrase)
-	phraseParam := nextArg(escapedPhrase)               // $1
+	phraseParam := nextArg(escapedPhrase) // $1
 	phraseContains := "'%' || " + phraseParam + " || '%'"
 	phraseStartsWith := phraseParam + " || '%'"
 
@@ -1042,16 +1043,16 @@ func readRuntimeCLIVersion(metadata []byte) string {
 }
 
 type CreateIssueRequest struct {
-	Title              string   `json:"title"`
-	Description        *string  `json:"description"`
-	Status             string   `json:"status"`
-	Priority           string   `json:"priority"`
-	AssigneeType       *string  `json:"assignee_type"`
-	AssigneeID         *string  `json:"assignee_id"`
-	ParentIssueID      *string  `json:"parent_issue_id"`
-	ProjectID          *string  `json:"project_id"`
-	DueDate            *string  `json:"due_date"`
-	AttachmentIDs      []string `json:"attachment_ids,omitempty"`
+	Title         string   `json:"title"`
+	Description   *string  `json:"description"`
+	Status        string   `json:"status"`
+	Priority      string   `json:"priority"`
+	AssigneeType  *string  `json:"assignee_type"`
+	AssigneeID    *string  `json:"assignee_id"`
+	ParentIssueID *string  `json:"parent_issue_id"`
+	ProjectID     *string  `json:"project_id"`
+	DueDate       *string  `json:"due_date"`
+	AttachmentIDs []string `json:"attachment_ids,omitempty"`
 	// OriginType / OriginID stamp the new issue with its provenance so
 	// platform-internal flows can deterministically locate it later. Only
 	// trusted callers should set these — currently the daemon CLI passes
@@ -1287,16 +1288,16 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 }
 
 type UpdateIssueRequest struct {
-	Title              *string  `json:"title"`
-	Description        *string  `json:"description"`
-	Status             *string  `json:"status"`
-	Priority           *string  `json:"priority"`
-	AssigneeType       *string  `json:"assignee_type"`
-	AssigneeID         *string  `json:"assignee_id"`
-	Position           *float64 `json:"position"`
-	DueDate            *string  `json:"due_date"`
-	ParentIssueID      *string  `json:"parent_issue_id"`
-	ProjectID          *string  `json:"project_id"`
+	Title         *string  `json:"title"`
+	Description   *string  `json:"description"`
+	Status        *string  `json:"status"`
+	Priority      *string  `json:"priority"`
+	AssigneeType  *string  `json:"assignee_type"`
+	AssigneeID    *string  `json:"assignee_id"`
+	Position      *float64 `json:"position"`
+	DueDate       *string  `json:"due_date"`
+	ParentIssueID *string  `json:"parent_issue_id"`
+	ProjectID     *string  `json:"project_id"`
 }
 
 func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
@@ -1490,7 +1491,11 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 
 	// Reconcile task queue when assignee changes.
 	if assigneeChanged {
-		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID, service.CancellationMetadata{
+			Reason:          "superseded_by_assignee_change",
+			CancelledByType: actorType,
+			CancelledByID:   parseUUID(actorID),
+		})
 
 		if h.shouldEnqueueAgentTask(r.Context(), issue) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
@@ -1511,7 +1516,11 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// This is distinct from agent-managed status transitions — cancellation
 	// is a user-initiated terminal action that should stop execution.
 	if statusChanged && issue.Status == "cancelled" {
-		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID, service.CancellationMetadata{
+			Reason:          "issue_cancelled",
+			CancelledByType: actorType,
+			CancelledByID:   parseUUID(actorID),
+		})
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1628,7 +1637,12 @@ func (h *Handler) DeleteIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+	userID := requestUserID(r)
+	h.TaskService.CancelTasksForIssue(r.Context(), issue.ID, service.CancellationMetadata{
+		Reason:          "issue_deleted",
+		CancelledByType: "member",
+		CancelledByID:   parseUUID(userID),
+	})
 	// Fail any linked autopilot runs before delete (ON DELETE SET NULL clears issue_id).
 	h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
@@ -1642,7 +1656,6 @@ func (h *Handler) DeleteIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.deleteS3Objects(r.Context(), attachmentURLs)
-	userID := requestUserID(r)
 	actorType, actorID := h.resolveActor(r, userID, uuidToString(issue.WorkspaceID))
 	// Always emit the resolved UUID — frontend caches key by UUID, so an
 	// identifier-style payload ("MUL-123") would leave stale entries on
@@ -1876,7 +1889,11 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		})
 
 		if assigneeChanged {
-			h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+			h.TaskService.CancelTasksForIssue(r.Context(), issue.ID, service.CancellationMetadata{
+				Reason:          "superseded_by_assignee_change",
+				CancelledByType: actorType,
+				CancelledByID:   parseUUID(actorID),
+			})
 			if h.shouldEnqueueAgentTask(r.Context(), issue) {
 				h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
 			}
@@ -1892,7 +1909,11 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 
 		// Cancel active tasks when the issue is cancelled by a user.
 		if statusChanged && issue.Status == "cancelled" {
-			h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+			h.TaskService.CancelTasksForIssue(r.Context(), issue.ID, service.CancellationMetadata{
+				Reason:          "issue_cancelled",
+				CancelledByType: actorType,
+				CancelledByID:   parseUUID(actorID),
+			})
 		}
 
 		updated++
@@ -1942,7 +1963,11 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID, service.CancellationMetadata{
+			Reason:          "issue_deleted",
+			CancelledByType: "member",
+			CancelledByID:   parseUUID(userID),
+		})
 		h.Queries.FailAutopilotRunsByIssue(r.Context(), issue.ID)
 
 		// Collect attachment URLs before CASCADE delete to clean up S3 objects.

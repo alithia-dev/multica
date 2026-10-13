@@ -1091,7 +1091,10 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			"has_autopilot_run", task.AutopilotRunID.Valid,
 			"has_quick_create", hasQuickCreate,
 		)
-		if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+		if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID, service.CancellationMetadata{
+			Reason:          "server_workspace_isolation",
+			CancelledByType: "server",
+		}); cerr != nil {
 			slog.Error("task claim: cancel after workspace check failed",
 				"task_id", uuidToString(task.ID), "error", cerr)
 		}
@@ -1527,7 +1530,13 @@ func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := h.TaskService.CancelTask(r.Context(), existing.ID)
+	userID := requestUserID(r)
+	actorType, actorID := h.resolveActor(r, userID, uuidToString(issue.WorkspaceID))
+	task, err := h.TaskService.CancelTask(r.Context(), existing.ID, service.CancellationMetadata{
+		Reason:          "user_cancelled_task",
+		CancelledByType: actorType,
+		CancelledByID:   parseUUID(actorID),
+	})
 	if err != nil {
 		slog.Warn("cancel task failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
